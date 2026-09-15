@@ -25,8 +25,8 @@ what clicked and what didn't.
 - [ ] launch overhead and CUDA graphs
 
 ### Numerics
-- [ ] FP16/BF16/FP32/TF32
-- [ ] accumulation order and error
+- [x] FP16/BF16/FP32/TF32
+- [x] accumulation order and error
 - [ ] symmetric vs asymmetric quantization
 - [ ] granularity (tensor/channel/group/block)
 - [ ] zero-point
@@ -51,8 +51,8 @@ what clicked and what didn't.
 
 ### Kernels written
 - [x] reductions
-- [ ] RMSNorm
-- [ ] online softmax
+- [x] RMSNorm
+- [x] online softmax
 - [ ] GEMV (FP16, W8A16, W4A16-group)
 - [ ] INT8 tensor-core GEMM
 - [ ] fused SwiGLU
@@ -166,3 +166,67 @@ padding column shifts each row's start by one bank, so the same column-wise
 access pattern now lands on 32 distinct banks. At n=512 all three are within
 noise (too few tiles per launch to amortize overhead); the effect only shows
 up once the kernel runs long enough for bank conflicts to actually dominate.
+
+### M2 -- RMSNorm, online softmax, FP16 GEMV (done)
+
+2026-09-15. Code was written and committed in a GPU-less local session; this
+entry covers what happened running it for real on the Colab T4 -- two bugs
+that only exist on hardware, both worth remembering because they're the
+kind that a GPU-less write-then-hope workflow can't catch in advance.
+
+**Bug 1 -- NaN in `softmax_online` from combining two identity states.**
+`block_reduce_softmax` pads unused warp lanes (this launch uses 256 threads
+= 8 warps, so the second-stage warp-shuffle tree always has real values in
+lanes 0-7 and identity padding in lanes 8-31) with `SoftmaxState{-INFINITY,
+0.0f}`. The FlashAttention-style combine recurrence computes `a.l *
+exp(a.m - m) + b.l * exp(b.m - m)` -- correct when at most one side is the
+identity, but when the shuffle tree combines two identity states together
+(which it does, structurally, whenever `num_warps < 32`), `a.m - m` becomes
+`-inf - -inf = NaN`. `fmaxf` alone would have resolved `m` fine (it ignores
+NaN operands), but `l` still gets poisoned because the *other* operand's
+`l` is independently NaN by the same mechanism, and `real_l + NaN = NaN`
+regardless of what `m` resolves to. Fix: use a finite very-negative
+sentinel (`-1e30f`) as the identity's `m` instead of `-INFINITY`, so two
+identities combine to `0 - 0 = 0` (finite) rather than `NaN`. The general
+lesson -- and the reason this is worth writing down rather than just
+patching -- is that `-INFINITY` is a dangerous reduction identity for any
+recurrence that *subtracts* two instances of it, even though it's the
+mathematically "obvious" choice for a running max.
+
+**Bug 2 -- flaky GEMV parity tests, but the kernels were never wrong.**
+`gemv_fp16_v1` and `gemv_fp16_v4_splitk(split=1)` failed intermittently
+against a flat `max_abs_err < 1e-2` bound, with observed errors that were
+suspiciously always exact powers of two (0.015625, then 0.03125 on a
+rerun with fresh random data -- no fixed seed). That pattern is the
+signature of FP16 ULP spacing, not a computation bug: GEMV output
+magnitude scales as `sqrt(K)` for unit-variance random inputs (std ~64 at
+K=4096, ~256 at K=65536, the two shapes these tests use), and at that
+magnitude a single FP16 ULP is already 0.016-0.25 -- bigger than the flat
+tolerance. Two *independently* fp32-accumulated dot products (the kernel's
+summation order vs PyTorch's) can legitimately round to adjacent FP16
+values with zero real error between them. It hit v1 and split=1
+specifically (not v2/v3/other splits) because those two happen to sum the
+most terms sequentially into a single accumulator before any tree
+reduction, giving their rounding trajectory the most chances to land on
+the "wrong side" of a representable-value boundary relative to PyTorch's
+own reduction order. Fix: switch the GEMV parity checks to a
+magnitude-scaled bound (`atol + rtol * |expected|`, the same shape as
+`torch.allclose`) instead of a flat absolute one. RMSNorm and softmax
+outputs stay near unit magnitude, so the flat bound was never actually
+wrong for those -- this is specific to GEMV's `sqrt(K)`-scaled output.
+
+Both fixes pushed and re-verified on the T4 (`make test`: 35/35 passed,
+rerun three times to confirm the ULP flakiness was actually gone and not
+just not-triggered). Results: `reports/m2_gemv_bandwidth.{csv,png}`,
+`reports/m2_norm_softmax_splitk.csv`. `gemv_fp16_v3` hits 260.1 GB/s at
+K=4096 against a 224 GB/s (70% of the 320 GB/s peak) bar -- comfortably
+clears the M2 acceptance criterion. v1->v2 is roughly a 5x jump (46 ->
+225 GB/s) from the same warp-shuffle-reduction win M1's sum-reduction
+already demonstrated; v2->v3's vectorized `float4` loads add another
+~15%, smaller than M1's reduction case because GEMV is already spending
+more of its time on the shuffle-reduce and FMA work relative to load
+instruction count. Split-K past 8-way stops helping (8-way: 232 GB/s,
+32-way: 210 GB/s) -- more splits means more `atomicAdd` contention on the
+same small set of output accumulators, so at some point added parallelism
+loses to atomic serialization, mirroring the M1 naive-atomic-reduction
+lesson from the opposite direction.
