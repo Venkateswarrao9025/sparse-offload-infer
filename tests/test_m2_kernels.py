@@ -8,6 +8,8 @@ import pytest
 import torch
 
 soinfer = pytest.importorskip("soinfer")
+if soinfer.ops is None:
+    pytest.skip("soinfer._C (CUDA extension) not built", allow_module_level=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="M2 kernels require a CUDA GPU")
 

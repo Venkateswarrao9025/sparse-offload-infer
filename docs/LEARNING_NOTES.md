@@ -27,13 +27,13 @@ what clicked and what didn't.
 ### Numerics
 - [x] FP16/BF16/FP32/TF32
 - [x] accumulation order and error
-- [ ] symmetric vs asymmetric quantization
-- [ ] granularity (tensor/channel/group/block)
+- [x] symmetric vs asymmetric quantization
+- [x] granularity (tensor/channel/group/block)
 - [ ] zero-point
-- [ ] outlier channels
-- [ ] E8M0 and microscaling
-- [ ] fake quant vs real quant
-- [ ] calibration (min-max, percentile, MSE, AWQ)
+- [x] outlier channels
+- [x] E8M0 and microscaling
+- [x] fake quant vs real quant
+- [x] calibration (min-max, percentile, MSE, AWQ)
 - [ ] GPTQ
 
 ### Inference systems
@@ -230,3 +230,89 @@ instruction count. Split-K past 8-way stops helping (8-way: 232 GB/s,
 same small set of output accumulators, so at some point added parallelism
 loses to atomic serialization, mirroring the M1 naive-atomic-reduction
 lesson from the opposite direction.
+
+### M3 -- quantization library (in progress: formats/pack/calibrate done, WikiText-2 eval pending)
+
+2026-09-15. Pure Python/PyTorch, no CUDA -- the whole point of doing this
+work before any dequant kernel exists (PROJECT_SPEC.md M3's own framing:
+"much easier to debug in Python"). Two infrastructure issues surfaced
+before the quantization work itself, both worth remembering:
+
+**The M2-fix-for-M3 problem, and the regression it caused.** `soinfer/quant/`
+needed to be importable on this GPU-less dev machine, but `soinfer/__init__.py`
+unconditionally did `from . import ops`, which imports the compiled
+`soinfer._C` extension -- so `import soinfer` hard-failed here, and would
+have taken `soinfer.quant` down with it. Fixed by making the `ops` import
+lazy (`try/except ImportError: ops = None`). That fix broke something else,
+though: `tests/test_m1_fundamentals.py` and `test_m2_kernels.py` reference
+`soinfer.ops.reduce_naive_atomic` etc. directly inside `@pytest.mark.parametrize(...)`
+decorator arguments, which Python evaluates at *module import time*, before
+any `skipif` marker gets a chance to run. Previously `pytest.importorskip("soinfer")`
+caught this (import failure -> skip, before the parametrize lines ever
+executed); once `import soinfer` started succeeding with `ops = None`, those
+lines hit `AttributeError: 'NoneType' object has no attribute '...'`
+instead of skipping cleanly. Fix: an explicit
+`if soinfer.ops is None: pytest.skip(..., allow_module_level=True)` right
+after the importorskip line, before any parametrize decorator runs. Lesson worth
+keeping: `pytest.importorskip` only protects against *import* failure, not
+against a module that imports fine but leaves something you depend on
+`None` -- decorator arguments are the sharp edge because they run at
+collection time, not test time, so a module-level skip must come before
+them explicitly.
+
+**A local pytest run needs `soinfer` on `sys.path` without an editable
+install.** `pip install -e .` needs to compile the CUDA extension via
+`torch.utils.cpp_extension`, which needs `nvcc` -- not available here. Added
+a root `conftest.py` that inserts `python/` onto `sys.path` directly, which
+is exactly what an editable install's `.pth` file would do anyway; on Colab
+(where the real editable install already exists) this is a harmless no-op.
+This is what actually makes M3's "no CUDA needed" promise real rather than
+aspirational -- without it, `soinfer.quant` was reachable in principle but
+not in practice on this machine.
+
+**The quantization library itself.** `formats.py` implements five symmetric
+(no zero-point) granularities -- per-tensor, per-channel, group-wise
+(default 128), block-32, and OCP-style microscaling -- all sharing one
+`quantize`/`dequantize` pair; `mx_e8m0` is implemented as block32's exact
+scale rounded to the nearest power of two via `round_to_pow2`, so the two
+formats differ in *only* that one step, by design (this is what lets Study
+B isolate the cost of power-of-two scales rather than conflating it with a
+grouping-size difference). `calibrate.py` provides four scale strategies
+(`min_max`, `percentile`, `mse_optimal`, and AWQ-style activation-aware
+per-channel pre-scaling) as a `scale_fn(grouped, amax, qmax) -> scale`
+callback pluggable into `quantize()`. `pack.py` implements the INT4
+bit-packing decided in `csrc/include/layout.h`: two values per byte in AWQ
+order (`[0,2,4,6,1,3,5,7]`), chosen so a future CUDA dequant kernel can pull
+the four even-indexed and four odd-indexed values out of one 32-bit load
+via two 16-bit masks with no further shuffling -- decided and written down
+now (M3) specifically so M4's LOP3 dequant kernel doesn't have to
+re-derive and re-test a packing scheme from scratch. All of it round-trips
+exactly (`tests/test_quant_roundtrip.py`, 31 tests, including ragged K not
+a multiple of 8 for packing and not a multiple of 32/128 for grouping).
+
+**Reproducing the per-tensor INT4 collapse.** `bench/bench_m3_quant.py`
+sweeps all five formats at 4 and 8 bits on a synthetic weight tensor
+(Gaussian base, ~0.5% of *columns* -- i.e. input/K-channels, shared across
+every row -- scaled 25x to stand in for the real "outlier feature" columns
+reported in the LLM.int8() / AWQ literature). Results in
+`reports/m3_quant_accuracy.csv`. At 4-bit: per-tensor forces 99.6% of
+weights to exact zero, per-channel 99.4%, group-128 43.8%, block-32/mx_e8m0
+~21.5%. The per-channel number is the interesting one and not a bug: this
+project's `per_channel` granularity scales per *output row*, and the
+injected outliers live in specific *input columns* shared by every row --
+so a per-row scale is set by the same outlier columns no matter which row
+you look at, and per-channel quantization gives zero protection against a
+column-shared outlier. That is exactly the failure mode AWQ's activation-
+aware per-channel *weight* scaling (implemented in `calibrate.awq_scale`)
+exists to fix from the other direction: since the outlier can't be escaped
+by choosing a different grouping axis, AWQ instead shrinks the quantization
+error on those specific channels by scaling them relative to how much they
+actually matter (their activation magnitude), rather than by grouping.
+
+**Deferred:** PROJECT_SPEC.md M3 task 4 (fake-quant perplexity on
+WikiText-2 across formats, on the real dev model) needs `transformers` +
+`datasets` installed and an actual model download -- not done yet, pending
+a decision on whether to run it locally (slow, CPU-only here) or on Colab.
+`reports/m3_quant_accuracy.csv` is the *synthetic* zero-fraction/
+reconstruction-error table only; it is not a substitute for that real
+result and the code doesn't claim it is.
