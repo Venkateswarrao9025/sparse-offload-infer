@@ -39,4 +39,75 @@ generation -- compilation overhead likely isn't amortized; not investigated
 further, out of scope for M0). This FP16 number (~23 tok/s) is the baseline
 soinfer's own kernels are compared against from M4 onward.
 
-Pending: M1 onward.
+## M1 -- CUDA fundamentals
+
+Same T4 session as M0 (clock locked to 1590 MHz). Source: `reports/m1_bandwidth.csv`,
+`reports/m1_bandwidth.png`.
+
+**Vector add** (`out = a + b`, achieved GB/s = 3*n*4 bytes / time):
+
+| n (elements) | achieved GB/s |
+|---|---|
+| 262,144 | 167.0 |
+| 1,048,576 | 213.1 |
+| 4,194,304 | 244.1 |
+| 16,777,216 | **254.9** |
+
+Approaches but doesn't reach the 320 GB/s peak even at 16M elements -- launch
+overhead and imperfect occupancy still cost a few percent at this size; the
+larger-still sizes needed to fully amortize that were out of scope for a M1
+warm-up kernel.
+
+**Strided copy** (coalescing collapse; nominal GB/s = 2*n*4 bytes / time, n=2^18 fixed):
+
+| stride | achieved GB/s |
+|---|---|
+| 1 | 114.5 |
+| 2 | 113.8 |
+| 4 | 71.8 |
+| 8 | 46.5 |
+| 16 | 26.3 |
+| 32 | 24.4 |
+| 64 | 22.6 |
+| 128 | **19.4** |
+
+Monotonic collapse as stride grows -- by stride 128 achieved bandwidth is
+~6x lower than stride 1, for the exact same number of "useful" bytes moved.
+(Absolute numbers here are lower than vector_add's because this sweep uses a
+much smaller working set, 1-128 MB vs up to 64 MB x2; the collapse *shape*,
+not the absolute GB/s, is the point of this kernel.)
+
+**Sum reduction** (n=2^24, achieved GB/s = n*4 bytes read / time):
+
+| variant | achieved GB/s |
+|---|---|
+| v1 naive atomic | 2.0 |
+| v2 shared-memory tree | 92.0 |
+| v3 warp-shuffle | 147.4 |
+| v4 vectorized float4 + warp-shuffle | **273.1** |
+
+v1-to-v2 is a **46x** jump (eliminating global-atomic contention by reducing
+within a block first); v2-to-v3 is another 1.6x (avoiding shared-memory
+traffic and `__syncthreads()` entirely inside a warp); v3-to-v4 is another
+1.9x (4x fewer thread-instructions issued per byte, via `float4` loads).
+v4 reaches within 15% of the 320 GB/s peak.
+
+**Transpose** (n x n, achieved GB/s = 2*n^2*4 bytes / time):
+
+| n | naive | tiled, unpadded | tiled, padded |
+|---|---|---|---|
+| 512 | 53.9 | 57.1 | 52.6 |
+| 1024 | 91.0 | 154.6 | 177.0 |
+| 2048 | 96.8 | 143.9 | **200.0** |
+| 4096 | 79.1 | 177.0 | **201.8** |
+
+At n=512 the three are within noise of each other (too few tiles to amortize
+launch overhead). From n=1024 up, the pattern is consistent: naive (fully
+uncoalesced writes) is slowest, tiling through shared memory roughly doubles
+throughput by making both global reads and writes coalesced, and padding the
+shared-memory tile by one column adds another consistent ~15-25% by removing
+the 32-way bank conflict on the transposed read out of shared memory.
+
+See `docs/LEARNING_NOTES.md` for the fuller explanation of each jump.
+
+Pending: M2 onward.
