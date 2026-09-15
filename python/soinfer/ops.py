@@ -52,3 +52,38 @@ def transpose_unpadded(x: torch.Tensor) -> torch.Tensor:
 def transpose_padded(x: torch.Tensor) -> torch.Tensor:
     """Square matrix transpose v3: shared-memory tiled, padded to avoid bank conflicts. M1."""
     return _C.transpose_padded(x)
+
+
+def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """RMSNorm over the last dim. x: [rows, hidden] half, weight: [hidden] half. hidden must be even. M2."""
+    return _C.rmsnorm(x, weight, eps)
+
+
+def softmax_twopass(x: torch.Tensor) -> torch.Tensor:
+    """Row-wise softmax v1: naive two-pass statistics (max pass, then sum pass). x: [rows, cols] half. M2."""
+    return _C.softmax_twopass(x)
+
+
+def softmax_online(x: torch.Tensor) -> torch.Tensor:
+    """Row-wise softmax v2: online single-pass statistics (FlashAttention rescaling recurrence). M2."""
+    return _C.softmax_online(x)
+
+
+def gemv_fp16_v1(W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """y = W @ x. v1: one thread per output row. W: [N,K] half, x: [K] half. M2."""
+    return _C.gemv_fp16_v1(W, x)
+
+
+def gemv_fp16_v2(W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """y = W @ x. v2: one warp per row, warp-shuffle reduce. M2."""
+    return _C.gemv_fp16_v2(W, x)
+
+
+def gemv_fp16_v3(W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """y = W @ x. v3: v2 + float4-vectorized loads. Requires K % 8 == 0. M2."""
+    return _C.gemv_fp16_v3(W, x)
+
+
+def gemv_fp16_v4_splitk(W: torch.Tensor, x: torch.Tensor, split: int) -> torch.Tensor:
+    """y = W @ x. v4: split-K with atomics -- helps when N is too small to saturate the GPU. M2."""
+    return _C.gemv_fp16_v4_splitk(W, x, split)

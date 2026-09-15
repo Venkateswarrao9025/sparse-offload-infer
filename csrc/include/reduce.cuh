@@ -34,3 +34,30 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* shared) {
     }
     return val;
 }
+
+// Same as warp_reduce_sum/block_reduce_sum but for max. Used by the two-pass
+// softmax kernel's max pass.
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffffu, val, offset));
+    }
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_max(float val, float* shared) {
+    const int lane = threadIdx.x % 32;
+    const int warp_id = threadIdx.x / 32;
+
+    val = warp_reduce_max(val);
+    if (lane == 0) {
+        shared[warp_id] = val;
+    }
+    __syncthreads();
+
+    const int num_warps = (blockDim.x + 31) / 32;
+    val = (threadIdx.x < num_warps) ? shared[lane] : -INFINITY;
+    if (warp_id == 0) {
+        val = warp_reduce_max(val);
+    }
+    return val;
+}
