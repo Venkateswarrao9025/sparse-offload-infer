@@ -14,3 +14,18 @@ void launch_add_one(const float* in, float* out, int64_t n) {
     add_one_kernel<<<static_cast<unsigned int>(blocks), threads>>>(in, out, n);
     CUDA_CHECK(cudaGetLastError());
 }
+
+__global__ void vector_add_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                   float* __restrict__ out, int64_t n) {
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = a[i] + b[i];
+    }
+}
+
+void launch_vector_add(const float* a, const float* b, float* out, int64_t n) {
+    const int threads = 256;
+    const int64_t blocks = ceil_div(n, static_cast<int64_t>(threads));
+    vector_add_kernel<<<static_cast<unsigned int>(blocks), threads>>>(a, b, out, n);
+    CUDA_CHECK(cudaGetLastError());
+}

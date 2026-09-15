@@ -24,6 +24,9 @@ ext_modules = [
         sources=[
             os.path.join(CSRC_DIR, "bindings.cpp"),
             os.path.join(CSRC_DIR, "kernels", "elementwise.cu"),
+            os.path.join(CSRC_DIR, "kernels", "strided_copy.cu"),
+            os.path.join(CSRC_DIR, "kernels", "reduce_demo.cu"),
+            os.path.join(CSRC_DIR, "kernels", "transpose.cu"),
         ],
         include_dirs=[
             os.path.join(CSRC_DIR, "include"),
@@ -49,6 +52,7 @@ setup(
         "transformers>=4.40",
         "accelerate>=0.30",
         "numpy",
+        "matplotlib",
     ],
     python_requires=">=3.10",
 )
