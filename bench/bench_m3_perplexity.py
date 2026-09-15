@@ -52,17 +52,17 @@ def perplexity(model, tokenizer, text: str, max_length: int = MAX_LENGTH) -> flo
     input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
     seq_len = input_ids.size(1)
 
-    total_nll = torch.zeros((), dtype=torch.float64)
+    total_nll = 0.0
     total_tokens = 0
     for begin in range(0, seq_len, max_length):
         chunk = input_ids[:, begin : begin + max_length]
         if chunk.size(1) < 2:
             continue
-        loss = model(chunk, labels=chunk).loss.double()
+        loss = model(chunk, labels=chunk).loss.item()  # scalar float, no device to track
         n = chunk.size(1) - 1  # HF's internal label shift predicts n tokens from n+1 inputs
         total_nll += loss * n
         total_tokens += n
-    return torch.exp(total_nll / total_tokens).item()
+    return float(torch.exp(torch.tensor(total_nll / total_tokens)))
 
 
 def main() -> None:
