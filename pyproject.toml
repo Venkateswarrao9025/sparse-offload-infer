@@ -1,0 +1,7 @@
+[build-system]
+# torch is intentionally NOT listed here: build with `--no-build-isolation`
+# (see Makefile) so the extension links against the exact torch/CUDA already
+# installed in the environment (e.g. Colab's preinstalled torch+cu121), rather
+# than pip building an isolated env and grabbing a possibly-mismatched torch.
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+build/
+*.egg-info/
+.eggs/
+*.so
+.ipynb_checkpoints/
+.venv/
+venv/
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+.DS_Store
