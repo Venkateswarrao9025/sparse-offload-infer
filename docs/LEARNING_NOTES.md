@@ -231,7 +231,7 @@ same small set of output accumulators, so at some point added parallelism
 loses to atomic serialization, mirroring the M1 naive-atomic-reduction
 lesson from the opposite direction.
 
-### M3 -- quantization library (in progress: formats/pack/calibrate done, WikiText-2 eval pending)
+### M3 -- quantization library (done)
 
 2026-09-15. Pure Python/PyTorch, no CUDA -- the whole point of doing this
 work before any dequant kernel exists (PROJECT_SPEC.md M3's own framing:
@@ -309,10 +309,44 @@ by choosing a different grouping axis, AWQ instead shrinks the quantization
 error on those specific channels by scaling them relative to how much they
 actually matter (their activation magnitude), rather than by grouping.
 
-**Deferred:** PROJECT_SPEC.md M3 task 4 (fake-quant perplexity on
-WikiText-2 across formats, on the real dev model) needs `transformers` +
-`datasets` installed and an actual model download -- not done yet, pending
-a decision on whether to run it locally (slow, CPU-only here) or on Colab.
-`reports/m3_quant_accuracy.csv` is the *synthetic* zero-fraction/
-reconstruction-error table only; it is not a substitute for that real
-result and the code doesn't claim it is.
+**The real WikiText-2 perplexity sweep (M3 task 4, now done).** Ran
+`bench/bench_m3_perplexity.py` on Colab against Qwen3-1.7B (verified
+SwiGLU MLP), all 5 formats at 4 and 8 bits, WikiText-2 raw test split.
+Results in `reports/m3_perplexity.csv`. Two real bugs surfaced getting
+this to actually run (neither is a quantization-logic bug -- both are the
+kind of environment/API-drift issue that only shows up running against
+real infrastructure, which this GPU-less dev machine can't do for anything
+touching a real model):
+- `load_dataset("wikitext", "wikitext-2-raw-v1", ...)` fails under current
+  `datasets`/`huggingface_hub` versions -- the bare `"wikitext"` repo id
+  needs a namespace now (`HfUriError: Repository id must be
+  'namespace/name'`). Fixed: `"Salesforce/wikitext"`.
+- `total_nll` was a CPU tensor (`torch.zeros()` defaults to CPU) accumulating
+  `loss * n` where `loss` lives on `cuda:0` -- device-mismatch
+  `RuntimeError`. Fixed by `.item()`-ing the loss into a plain Python float
+  before accumulating; a scalar running sum has no device to get wrong.
+
+**The result, and why it's worth having a real model to confirm the
+synthetic one.** FP16 baseline perplexity: 18.52. At 8-bit every format
+stays close (18.28-21.76 -- `mx_e8m0` pays the expected small premium for
+power-of-two scales). At 4-bit: `per_tensor` perplexity is **11,054,325**
+-- not "worse," a completely broken model -- while every other 4-bit
+format lands in a normal 22-31 range (`per_channel` 31.3, `group128` 24.3,
+`block32` 22.8, `mx_e8m0` 22.6). This is the exact per-tensor INT4 collapse
+`bench_m3_quant.py`'s synthetic experiment predicted, now confirmed on
+real weights -- and it's a sharper result than the synthetic one in one
+respect: on the real model, `per_channel` (31.3) recovers most of the way
+back toward the well-behaved formats, unlike the synthetic experiment
+where per_channel was exactly as broken as per_tensor (99.4% vs 99.6%
+exact-zero). That's not a contradiction, it's the synthetic experiment's
+outlier shape showing its limits: it deliberately injected *column*-shared
+outliers (the same input channels large in every row) specifically to
+demonstrate that per-channel-by-row scaling gives zero protection against
+that shape -- a real point, but real Qwen3-1.7B weight outliers evidently
+aren't dominated by that particular shape, so per-row scaling recovers
+real signal here that it couldn't in the adversarial synthetic case.
+Lesson: a synthetic stress test can correctly demonstrate a *mechanism*
+(per-tensor collapse; per-channel's blind spot to column-shared outliers)
+without its exact severity numbers transferring to a real model whose
+outlier structure differs -- which is exactly why M3 task 4 asked for the
+real number rather than treating the synthetic table as sufficient.
