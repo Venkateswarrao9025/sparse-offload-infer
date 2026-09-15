@@ -60,6 +60,13 @@ struct SoftmaxState {
     float l;  // running sum of exp(x - m)
 };
 
+// Finite stand-in for -infinity as the reduction identity's max: combining
+// two identities computes (a.m - m) in the recurrence below, and
+// -INFINITY - -INFINITY is NaN (poisons l even though fmaxf alone would
+// resolve m correctly). A large finite negative value keeps that
+// subtraction at exactly 0.
+constexpr float kNegInfSentinel = -1e30f;
+
 // Combines two (max, sum) states via the FlashAttention rescaling
 // recurrence. Associative and commutative, so it works as a reduction op.
 __device__ __forceinline__ SoftmaxState combine_softmax(SoftmaxState a, SoftmaxState b) {
@@ -89,7 +96,7 @@ __device__ __forceinline__ SoftmaxState block_reduce_softmax(SoftmaxState val, S
     __syncthreads();
 
     const int num_warps = (blockDim.x + 31) / 32;
-    const SoftmaxState identity{-INFINITY, 0.0f};
+    const SoftmaxState identity{kNegInfSentinel, 0.0f};
     val = (threadIdx.x < num_warps) ? shared[lane] : identity;
     if (warp_id == 0) {
         val = warp_reduce_softmax(val);
@@ -106,7 +113,7 @@ __global__ void softmax_online_kernel(const half* __restrict__ x, half* __restri
     const half* x_row = x + static_cast<size_t>(row) * cols;
     half* out_row = out + static_cast<size_t>(row) * cols;
 
-    SoftmaxState local{-INFINITY, 0.0f};
+    SoftmaxState local{kNegInfSentinel, 0.0f};
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         const float xi = __half2float(x_row[i]);
         local = combine_softmax(local, SoftmaxState{xi, 1.0f});
