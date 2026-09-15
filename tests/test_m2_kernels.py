@@ -13,9 +13,28 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="M2 kernel
 
 MAX_ABS_ERR = 1e-2
 
+# GEMV output magnitude scales as sqrt(K) for unit-variance random inputs
+# (std ~64 at K=4096, ~256 at K=65536). At that magnitude a single FP16 ULP
+# is already 0.016-0.25 -- bigger than MAX_ABS_ERR -- so two independently
+# -computed reductions (the kernel's summation order vs PyTorch's) can round
+# to adjacent FP16 values with no actual error. GEMV comparisons use a
+# magnitude-scaled bound (same shape as torch.allclose) instead; RMSNorm and
+# softmax outputs stay near unit magnitude so the flat MAX_ABS_ERR is fine
+# for them as-is.
+GEMV_RTOL = 5e-3
+
 
 def max_abs_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return (actual.float() - expected.float()).abs().max().item()
+
+
+def assert_gemv_matches(actual: torch.Tensor, expected: torch.Tensor, label: str) -> None:
+    diff = (actual.float() - expected.float()).abs()
+    bound = MAX_ABS_ERR + GEMV_RTOL * expected.float().abs()
+    assert torch.all(diff < bound), (
+        f"{label} exceeds scaled tolerance: max diff {diff.max().item()} "
+        f"at bound {bound[diff.argmax()].item()}"
+    )
 
 
 def rmsnorm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -65,8 +84,7 @@ def test_gemv_variants_match_reference(gemv_fn):
     x = torch.randn(K, device="cuda", dtype=torch.float16)
     expected = torch.mv(W.float(), x.float()).half()
     actual = gemv_fn(W, x)
-    err = max_abs_err(actual, expected)
-    assert err < MAX_ABS_ERR, f"{gemv_fn.__name__} max abs error {err} >= {MAX_ABS_ERR}"
+    assert_gemv_matches(actual, expected, gemv_fn.__name__)
 
 
 @pytest.mark.parametrize("gemv_fn", [soinfer.ops.gemv_fp16_v1, soinfer.ops.gemv_fp16_v2])
@@ -76,8 +94,7 @@ def test_gemv_v1_v2_handle_k_not_multiple_of_8(gemv_fn):
     x = torch.randn(K, device="cuda", dtype=torch.float16)
     expected = torch.mv(W.float(), x.float()).half()
     actual = gemv_fn(W, x)
-    err = max_abs_err(actual, expected)
-    assert err < MAX_ABS_ERR, f"{gemv_fn.__name__} max abs error {err} >= {MAX_ABS_ERR}"
+    assert_gemv_matches(actual, expected, gemv_fn.__name__)
 
 
 def test_gemv_v3_rejects_k_not_multiple_of_8():
@@ -94,5 +111,4 @@ def test_gemv_v4_splitk_matches_reference(split):
     x = torch.randn(K, device="cuda", dtype=torch.float16)
     expected = torch.mv(W.float(), x.float()).half()
     actual = soinfer.ops.gemv_fp16_v4_splitk(W, x, split)
-    err = max_abs_err(actual, expected)
-    assert err < MAX_ABS_ERR, f"gemv_fp16_v4_splitk(split={split}) max abs error {err} >= {MAX_ABS_ERR}"
+    assert_gemv_matches(actual, expected, f"gemv_fp16_v4_splitk(split={split})")
