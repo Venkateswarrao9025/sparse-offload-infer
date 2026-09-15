@@ -69,7 +69,7 @@ def main() -> None:
     model, tokenizer = load_model_and_tokenizer()
     verify_swiglu(model)
 
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     text = "\n\n".join(dataset["text"])
     print(f"WikiText-2 test: {len(text)} chars")
 
