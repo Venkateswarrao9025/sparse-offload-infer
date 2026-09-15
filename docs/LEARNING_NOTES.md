@@ -76,10 +76,35 @@ what clicked and what didn't.
 
 ## Milestone log
 
-### M0 -- Harness and baseline (in progress)
+### M0 -- Harness and baseline (done)
 
-Started 2026-09-14. Repo scaffolded locally (no NVIDIA GPU on the dev
-machine -- see docs/DESIGN.md). Next: push to GitHub, run the Colab
-bootstrap notebook, confirm `add_one` builds and passes, then run
-`bench_pcie.py` and `bench_baseline.py` on a T4 session to produce
-`reports/m0_pcie_bandwidth.csv` and `reports/m0_baseline.csv`.
+2026-09-14 -- 2026-09-15. Repo scaffolded locally (no NVIDIA GPU on the dev
+machine -- see docs/DESIGN.md), pushed to GitHub, driven from a Colab T4
+session via the `colab-mcp` MCP bridge (Claude Code editing/running notebook
+cells directly rather than a human clicking through them).
+
+What actually happened, worth remembering:
+- `uvx git+https://...` for an MCP server is slow on its very first
+  invocation (cloning + resolving ~100 deps) and blew through Claude Code's
+  30s MCP connection timeout on the first try. Once cached locally, it
+  connects in ~8s. If a similar MCP server ever times out on first connect,
+  retry rather than assume it's broken.
+- The Colab browser bridge attaches to a specific tab at connect time, not
+  dynamically to "whatever tab is focused now" -- if cell reads look wrong
+  (e.g. an unexpectedly blank notebook), close other Colab tabs and
+  re-open the connection.
+- transformers 5.x removed the `load_in_8bit=True` shorthand kwarg;
+  needs `quantization_config=BitsAndBytesConfig(load_in_8bit=True)` now.
+  Also: don't let one baseline variant's failure (missing bitsandbytes)
+  crash the script before `write_csv` runs -- wrap each variant so partial
+  results survive.
+- `add_one` built and passed on the first real compile against `sm_75` on
+  an actual T4 -- the `setup.py`/`common.cuh` arch-gating scaffolding from
+  the GPU-less local session translated correctly to real hardware.
+- Colab's T4 instance allowed `nvidia-smi -lgc` clock locking this session
+  (not guaranteed -- the notebook falls back gracefully if it's ever
+  refused).
+
+Results: see docs/RESULTS.md and `reports/m0_pcie_bandwidth.csv` /
+`reports/m0_baseline.csv`. Next: M1 (CUDA fundamentals -- vector add,
+coalescing sweep, reduction variants, transpose with/without padding).
