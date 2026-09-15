@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from harness import write_csv
@@ -62,19 +62,23 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     rows: list[dict] = []
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16).cuda().eval()
-    run_variant("hf_fp16", model, tokenizer, rows)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16).cuda().eval()
+        run_variant("hf_fp16", model, tokenizer, rows)
 
-    compiled = torch.compile(model)
-    run_variant("hf_fp16_compiled", compiled, tokenizer, rows)
-    del model, compiled
-    torch.cuda.empty_cache()
+        compiled = torch.compile(model)
+        run_variant("hf_fp16_compiled", compiled, tokenizer, rows)
+        del model, compiled
+        torch.cuda.empty_cache()
+    except Exception as e:  # noqa: BLE001 -- a baseline variant failing shouldn't lose the others' results
+        print(f"hf_fp16 / hf_fp16_compiled failed: {e!r} -- skipping (recorded as absent, not faked)")
 
     try:
-        bnb_model = AutoModelForCausalLM.from_pretrained(args.model, load_in_8bit=True, device_map="cuda")
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        bnb_model = AutoModelForCausalLM.from_pretrained(args.model, quantization_config=bnb_config, device_map="cuda")
         run_variant("bnb_int8", bnb_model, tokenizer, rows)
-    except ImportError:
-        print("bitsandbytes not installed -- skipping INT8 baseline (recorded as absent, not faked)")
+    except Exception as e:  # noqa: BLE001 -- ImportError if bitsandbytes is missing, RuntimeError/etc. otherwise
+        print(f"bnb_int8 failed: {e!r} -- skipping (recorded as absent, not faked)")
 
     out_path = Path(__file__).resolve().parent.parent / "reports" / "m0_baseline.csv"
     write_csv(rows, out_path)
