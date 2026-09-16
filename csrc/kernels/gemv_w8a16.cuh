@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <cuda_fp16.h>
 
 // y = W @ x, W stored as symmetric INT8 (W ~= scale * qweight, see

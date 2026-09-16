@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <cuda_fp16.h>
 
 // y = W @ x, W stored as symmetric grouped INT4, AWQ-interleaved packing (see
