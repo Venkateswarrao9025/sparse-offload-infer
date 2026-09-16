@@ -499,3 +499,103 @@ in PROJECT_SPEC.md, not M4's. Recorded here as an open gap rather than
 quietly declared "done": M4's kernels are correct and meaningfully faster
 than FP16 (a legitimate, real result), but the 3x acceptance bar is
 unmet and that's the honest number to carry forward.
+
+### M5 -- fused transformer kernels (in progress)
+
+2026-09-16. Wrote tasks 1-4 (fused SwiGLU MLP, fused QKV projection, KV
+cache append, decode attention) locally, all with PyTorch-reference tests
+in `tests/test_m5_kernels.py`. **Not yet run on hardware** -- lost the
+Colab tab mid-session (the browser bridge reconnected to a blank
+notebook instead of the one with the M4 build; see
+[[project-colab-workflow]]) and picked M5 up locally in the meantime
+rather than block on it. Task 5 ("RMSNorm + quantize fusion") is skipped
+as a scope conflict, not an oversight -- see docs/DESIGN.md's M5 entry:
+this project's only real quant formats (W4A16, W8A16) keep activations in
+FP16, so there's no activation-quantized format for an RMSNorm fusion to
+emit into.
+
+**Fetched the real Qwen3-1.7B config instead of guessing shapes.**
+`curl https://huggingface.co/Qwen/Qwen3-1.7B/raw/main/config.json` (no
+`transformers` install needed, no GPU needed, just the JSON file) gives
+hidden_size=2048, intermediate_size=6144, num_attention_heads=16,
+num_key_value_heads=8, head_dim=128 -- GQA with a 2:1 query:KV head
+ratio. `tests/test_m5_kernels.py`'s decode-attention/KV-cache tests use
+these exact numbers rather than arbitrary ones, so a shape bug that only
+shows up at the real model's dimensions (e.g. an edge case in how 128
+threads-per-block interacts with `block_reduce_sum`) has a chance of
+surfacing now instead of only during actual M5/M6 model integration.
+
+**Fused SwiGLU MLP (task 1): what "fusion" buys here, concretely.** The
+naive path is 4 kernel launches -- `gate_proj` GEMV, `up_proj` GEMV, an
+elementwise `silu(gate)*up`, `down_proj` GEMV -- and materializes gate and
+up as two separate `[I]` buffers that immediately get read back for the
+elementwise step. `swiglu_gate_up` (csrc/kernels/swiglu_fused.cu) collapses
+the first three into one kernel: each warp handles one intermediate-channel
+row `i`, reads ONE float4 chunk of `x` and reuses it for BOTH the gate and
+the up dot product (rather than two separate kernels each re-reading all of
+`x`), then writes `h[i] = silu(gate_i) * up_i` directly -- gate/up
+pre-activations never touch global memory as their own buffers, only `h`
+does. `down_proj` still needs the *complete* `h` before any output element
+exists, so it's a second kernel (reusing `gemv_fp16_v3` as-is, no new code)
+-- fusing across that boundary would need a grid-wide sync mid-kernel,
+which isn't worth it for what's left to gain. Net: 4 launches -> 2, and one
+fewer full round-trip of an `[I]`-sized buffer.
+
+**Fused QKV projection (task 2): the win is launches, not shared compute --
+so no new kernel at all.** Unlike gate/up, Q/K/V don't feed into a shared
+elementwise op afterward, so there's no arithmetic to fuse the way SwiGLU's
+dot products were. The only real lever at batch=1 (where GEMV kernels are
+short and launch-overhead can dominate) is cutting 3 launches to 1, which
+falls straight out of concatenating `Wq/Wk/Wv` into one `[q_dim+2*kv_dim,
+H]` matrix ONCE at model-load time and calling the existing `gemv_fp16_v3`
+on it -- `concat_qkv_weights` + `fused_qkv_projection` in ops.py, zero new
+CUDA. Worth noticing when a "fusion" task doesn't need a kernel at all.
+
+**KV cache append (task 3): contiguous layout, per layout.h's row-major
+convention.** `[num_kv_heads, max_seq_len, head_dim]` half, head_dim
+innermost so one head's whole history is one contiguous span (what decode
+attention's per-timestep dot products want). Append is one block per KV
+head copying `head_dim` contiguous halfs -- about as simple as a kernel
+gets, correctness here is really about the *layout* choice, not the copy
+itself. Paged (block-table) layout is noted as a stretch goal, not done.
+
+**Decode attention (task 4): a correctness-first, sync-heavy first cut.**
+One block per query head, `blockDim.x == head_dim` (one thread per feature
+dim). For each cached timestep, every thread computes its dim's product,
+`block_reduce_sum` (reused from M2's reduce.cuh) combines all `head_dim`
+partials into one score, broadcast back to every thread via a `__shared__`
+scalar (block_reduce_sum's result is only valid on thread 0 -- same
+broadcast pattern `softmax_online.cu` already uses), then every thread
+applies the *same* FlashAttention-style online-softmax rescale to its own
+slice of a running output accumulator: `new_m=max(m,s); corr=exp(m-new_m);
+p=exp(s-new_m); l=l*corr+p; acc[d]=acc[d]*corr+p*v[t,d]`. GQA head mapping
+(`kvh = qh / (num_q_heads/num_kv_heads)`) matches HF's `repeat_kv` grouping
+order exactly (checked against transformers' actual repeat/reshape, not
+assumed). This is O(cur_len) block-wide `__syncthreads()` calls per head --
+correct and simple, almost certainly slow at real sequence lengths (each
+sync is a real cost, and cur_len can be in the thousands by late decode).
+Explicitly scoped as "get the numerics right first" (mirrors this
+project's own M2 progression: `softmax_twopass` before `softmax_online`,
+`gemv_fp16_v1` before `v2/v3/v4`) -- a tiled/blocked-over-timesteps version
+that cuts the sync count is the natural next kernel once this is verified
+against HF, not a target for right now.
+
+**Deliberately NOT in the attention kernel: RoPE and Qwen3's QK-norm.**
+`decode_attention` takes `q` as already rotated (and, for Qwen3
+specifically, already per-head RMSNorm'd -- Qwen3 applies `q_norm`/`k_norm`
+to each head's Q/K before RoPE, which Llama does not do). Both are
+logically separate preprocessing steps on Q/K before the attention math
+proper, and getting RoPE's rotation convention and Qwen3's QK-norm exactly
+byte-right without a live HF reference to check against felt like exactly
+the kind of thing likely to be subtly wrong in a way only real numbers
+would catch. Scoped out for now rather than guessed at; needed before
+`test_layer_parity.py`/`test_end_to_end.py` can actually run, and is the
+first thing to build once Colab is back.
+
+**Next session, once Colab is reachable:** `make build && make test`,
+watch `test_m5_kernels.py` particularly closely on `decode_attention` (the
+`block_reduce_sum` broadcast pattern and the GQA head-grouping math are the
+two places most likely to have a subtle bug) and `kv_cache_append`+
+`decode_attention` together (the end-to-end-ish test). Then RoPE (+
+Qwen3's QK-norm) is the real blocker before a full-layer HF parity test is
+even possible.

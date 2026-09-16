@@ -32,6 +32,9 @@ ext_modules = [
             os.path.join(CSRC_DIR, "kernels", "gemv_fp16.cu"),
             os.path.join(CSRC_DIR, "kernels", "gemv_w8a16.cu"),
             os.path.join(CSRC_DIR, "kernels", "gemv_w4a16_group.cu"),
+            os.path.join(CSRC_DIR, "kernels", "swiglu_fused.cu"),
+            os.path.join(CSRC_DIR, "kernels", "kv_cache.cu"),
+            os.path.join(CSRC_DIR, "kernels", "decode_attention.cu"),
         ],
         include_dirs=[
             os.path.join(CSRC_DIR, "include"),

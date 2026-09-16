@@ -40,3 +40,24 @@ Colab/Kaggle, not locally at all.
 - **Arch flags:** `SOINFER_CUDA_ARCHS` env var (default `"75"`) drives
   `-gencode` flags in `setup.py`, so a Colab T4 build and any future
   Ampere+ build use the same setup.py without editing it.
+
+## M5 deviation: task 5 ("RMSNorm + quantize fusion") not implemented
+
+**Status:** active, as of 2026-09-16.
+
+PROJECT_SPEC.md M5 task 5 asks to "emit quantized activations directly from
+the norm." Section 2's explicit scope, though, is weight-only quantization:
+"Activation quantization below INT8 (W4A16 and W8A16 only; activations stay
+FP16)" is out of scope, and both this project's real quant formats (W4A16,
+W8A16) keep activations in FP16 -- there is no activation-quantized format
+in scope for an RMSNorm-fusion to emit into. Implementing this task as
+literally stated would mean inventing an activation quantization path the
+rest of the spec explicitly excludes.
+
+**Consequence:** M5's other four tasks (fused SwiGLU MLP, fused QKV
+projection, KV cache append, decode attention) are implemented; task 5 is
+skipped rather than built against a scope contradiction. If a future
+milestone reintroduces activation quantization (e.g. a W8A8 experiment as
+a stretch/study), revisit this and fuse the quantize step into `rmsnorm.cu`
+at that point -- the RMSNorm kernel itself needs no change to support it,
+since it already computes in fp32 before the final per-element write.

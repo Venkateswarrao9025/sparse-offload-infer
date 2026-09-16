@@ -1,14 +1,19 @@
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 
+#include <cmath>
+
+#include "kernels/decode_attention.cuh"
 #include "kernels/elementwise.cuh"
 #include "kernels/gemv_fp16.cuh"
 #include "kernels/gemv_w4a16_group.cuh"
 #include "kernels/gemv_w8a16.cuh"
+#include "kernels/kv_cache.cuh"
 #include "kernels/reduce_demo.cuh"
 #include "kernels/rmsnorm.cuh"
 #include "kernels/softmax_online.cuh"
 #include "kernels/strided_copy.cuh"
+#include "kernels/swiglu_fused.cuh"
 #include "kernels/transpose.cuh"
 
 namespace {
@@ -277,6 +282,62 @@ torch::Tensor gemv_w4a16_group_lop3(torch::Tensor Wq_packed, torch::Tensor scale
                                   launch_gemv_w4a16_group_lop3);
 }
 
+torch::Tensor swiglu_gate_up(torch::Tensor gate_W, torch::Tensor up_W, torch::Tensor x) {
+    check_f16_cuda_contiguous(gate_W, "swiglu_gate_up(gate_W)");
+    check_f16_cuda_contiguous(up_W, "swiglu_gate_up(up_W)");
+    check_f16_cuda_contiguous(x, "swiglu_gate_up(x)");
+    TORCH_CHECK(gate_W.dim() == 2 && up_W.dim() == 2, "swiglu_gate_up: gate_W and up_W must be 2D [I, H]");
+    TORCH_CHECK(gate_W.sizes() == up_W.sizes(), "swiglu_gate_up: gate_W and up_W must have the same shape");
+    TORCH_CHECK(x.dim() == 1 && x.size(0) == gate_W.size(1), "swiglu_gate_up: x must be 1D [H] matching the weights' H");
+    TORCH_CHECK(gate_W.size(1) % 8 == 0, "swiglu_gate_up: H must be a multiple of 8 (float4-vectorized loads)");
+
+    const int64_t I = gate_W.size(0), H = gate_W.size(1);
+    auto h = torch::empty({I}, x.options());
+    launch_swiglu_gate_up(half_ptr(gate_W), half_ptr(up_W), half_ptr(x), half_ptr(h), static_cast<int>(I),
+                           static_cast<int>(H));
+    return h;
+}
+
+void kv_cache_append(torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor k_new, torch::Tensor v_new,
+                      int64_t pos) {
+    check_f16_cuda_contiguous(k_cache, "kv_cache_append(k_cache)");
+    check_f16_cuda_contiguous(v_cache, "kv_cache_append(v_cache)");
+    check_f16_cuda_contiguous(k_new, "kv_cache_append(k_new)");
+    check_f16_cuda_contiguous(v_new, "kv_cache_append(v_new)");
+    TORCH_CHECK(k_cache.dim() == 3 && v_cache.sizes() == k_cache.sizes(),
+                "kv_cache_append: k_cache/v_cache must be 3D [num_kv_heads, max_seq_len, head_dim] and same shape");
+    TORCH_CHECK(k_new.sizes() == v_new.sizes(), "kv_cache_append: k_new/v_new must have the same shape");
+    TORCH_CHECK(k_new.dim() == 2 && k_new.size(0) == k_cache.size(0) && k_new.size(1) == k_cache.size(2),
+                "kv_cache_append: k_new/v_new must be 2D [num_kv_heads, head_dim] matching the cache");
+    const int64_t num_kv_heads = k_cache.size(0), max_seq_len = k_cache.size(1), head_dim = k_cache.size(2);
+    TORCH_CHECK(pos >= 0 && pos < max_seq_len, "kv_cache_append: pos out of range for max_seq_len");
+    launch_kv_cache_append(half_ptr(k_new), half_ptr(v_new), half_ptr(k_cache), half_ptr(v_cache),
+                            static_cast<int>(num_kv_heads), static_cast<int>(max_seq_len),
+                            static_cast<int>(head_dim), static_cast<int>(pos));
+}
+
+torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, int64_t cur_len) {
+    check_f16_cuda_contiguous(q, "decode_attention(q)");
+    check_f16_cuda_contiguous(k_cache, "decode_attention(k_cache)");
+    check_f16_cuda_contiguous(v_cache, "decode_attention(v_cache)");
+    TORCH_CHECK(q.dim() == 2, "decode_attention: q must be 2D [num_q_heads, head_dim]");
+    TORCH_CHECK(k_cache.dim() == 3 && v_cache.sizes() == k_cache.sizes(),
+                "decode_attention: k_cache/v_cache must be 3D [num_kv_heads, max_seq_len, head_dim] and same shape");
+    TORCH_CHECK(q.size(1) == k_cache.size(2), "decode_attention: q's head_dim must match the cache's head_dim");
+    const int64_t num_q_heads = q.size(0), num_kv_heads = k_cache.size(0), max_seq_len = k_cache.size(1),
+                  head_dim = k_cache.size(2);
+    TORCH_CHECK(num_q_heads % num_kv_heads == 0, "decode_attention: num_q_heads must be a multiple of num_kv_heads");
+    TORCH_CHECK(cur_len >= 1 && cur_len <= max_seq_len, "decode_attention: cur_len out of range for max_seq_len");
+
+    auto out = torch::empty({num_q_heads, head_dim}, q.options());
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    launch_decode_attention(half_ptr(q), half_ptr(k_cache), half_ptr(v_cache), half_ptr(out),
+                             static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads),
+                             static_cast<int>(max_seq_len), static_cast<int>(head_dim), static_cast<int>(cur_len),
+                             scale);
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("add_one", &add_one, "Add 1.0 to every element of a float32 CUDA tensor (M0 toolchain smoke test)");
     m.def("vector_add", &vector_add, "out = a + b, elementwise (M1)");
@@ -300,4 +361,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "W4A16 grouped GEMV: AWQ-packed INT4 weights, scalar dequant, register-cached group scale (M4)");
     m.def("gemv_w4a16_group_lop3", &gemv_w4a16_group_lop3,
           "W4A16 grouped GEMV: same as gemv_w4a16_group but with bit-pattern-construction INT4->FP16 dequant (M4)");
+    m.def("swiglu_gate_up", &swiglu_gate_up,
+          "Fused SwiGLU gate+up: h = silu(gate_W @ x) * (up_W @ x), one pass over x for both projections (M5)");
+    m.def("kv_cache_append", &kv_cache_append,
+          "Append one token's K/V into a contiguous [num_kv_heads, max_seq_len, head_dim] cache at `pos` (M5)");
+    m.def("decode_attention", &decode_attention,
+          "Single-query GQA decode attention over a KV cache, online-softmax, fp32 accumulation (M5)");
 }

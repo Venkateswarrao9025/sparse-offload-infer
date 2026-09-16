@@ -107,3 +107,59 @@ def gemv_w4a16_group_lop3(Wq_packed: torch.Tensor, scale: torch.Tensor, x: torch
     """Same contract as gemv_w4a16_group, but dequantizes via FP16 bit-pattern construction instead of
     int->float conversion instructions (PROJECT_SPEC.md M4 task 3). M4."""
     return _C.gemv_w4a16_group_lop3(Wq_packed, scale, x, K, group_size)
+
+
+def swiglu_gate_up(gate_W: torch.Tensor, up_W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """h = silu(gate_W @ x) * (up_W @ x). gate_W, up_W: [I,H] half, same shape. x: [H] half. H must be a
+    multiple of 8. Fuses the gate/up GEMVs (one shared pass over x) and the SiLU+multiply into one kernel --
+    only h round-trips to global memory, not separate gate/up pre-activation buffers. M5."""
+    return _C.swiglu_gate_up(gate_W, up_W, x)
+
+
+def fused_swiglu_mlp(gate_W: torch.Tensor, up_W: torch.Tensor, down_W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """y = down_W @ (silu(gate_W @ x) * (up_W @ x)) -- full SwiGLU MLP. gate_W, up_W: [I,H] half, down_W:
+    [H,I] half, x: [H] half. Uses swiglu_gate_up for the fused gate/up/SiLU pass, then gemv_fp16_v3 for the
+    down projection (down needs the complete intermediate vector, so it isn't fused into the same kernel --
+    see csrc/kernels/swiglu_fused.cuh). M5."""
+    h = swiglu_gate_up(gate_W, up_W, x)
+    return gemv_fp16_v3(down_W, h)
+
+
+def concat_qkv_weights(Wq: torch.Tensor, Wk: torch.Tensor, Wv: torch.Tensor) -> torch.Tensor:
+    """Build the [q_dim + 2*kv_dim, H] concatenated weight fused_qkv_projection expects. Call once at
+    model-load time, not per token -- the whole point is to amortize the concat cost across every
+    decode step. M5."""
+    return torch.cat([Wq, Wk, Wv], dim=0).contiguous()
+
+
+def fused_qkv_projection(
+    qkv_W: torch.Tensor, x: torch.Tensor, q_dim: int, kv_dim: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """q, k, v = split(qkv_W @ x). qkv_W: [q_dim + 2*kv_dim, H] half, built once via
+    concat_qkv_weights. Unlike swiglu_gate_up (where gate and up share a downstream elementwise
+    combine, so fusing the actual dot-product compute is the win), Q/K/V don't share any compute
+    -- the win here is purely launch-overhead and traffic-planning: one GEMV kernel launch and one
+    pass over x instead of three, which is what "one kernel, three outputs, one pass over x" (M5
+    task 2) means in the batch-1 decode regime where launches are the bottleneck, not FLOPs.
+    Reuses gemv_fp16_v3 rather than a new kernel -- no new compute pattern is needed once the
+    weights are concatenated. M5."""
+    qkv = gemv_fp16_v3(qkv_W, x)
+    q, k, v = qkv.split([q_dim, kv_dim, kv_dim])
+    return q, k, v
+
+
+def kv_cache_append(k_cache: torch.Tensor, v_cache: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor, pos: int) -> None:
+    """Writes k_new/v_new (each [num_kv_heads, head_dim] half) into k_cache/v_cache (each
+    [num_kv_heads, max_seq_len, head_dim] half) at sequence position `pos`, in place. Contiguous
+    layout (paged/block-table layout is a stretch goal, not implemented). M5."""
+    _C.kv_cache_append(k_cache, v_cache, k_new, v_new, pos)
+
+
+def decode_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, cur_len: int) -> torch.Tensor:
+    """out = attention(q, k_cache[:, :cur_len], v_cache[:, :cur_len]) for a single query token.
+    q: [num_q_heads, head_dim] half, already RoPE-rotated (and QK-normed, for architectures like
+    Qwen3 that use it) by the caller -- this kernel is the attention math only (scores, online
+    softmax, weighted V), not positional encoding. k_cache/v_cache: [num_kv_heads, max_seq_len,
+    head_dim] half; num_q_heads must be a multiple of num_kv_heads (GQA), grouped the same way as
+    HF's `repeat_kv` (query head qh reads KV head qh // (num_q_heads // num_kv_heads)). M5."""
+    return _C.decode_attention(q, k_cache, v_cache, cur_len)
