@@ -433,9 +433,69 @@ form is something I can actually reason about (and expect nvcc to lower to
 real `LOP3.LUT` instructions on Turing where profitable) without betting
 correctness on hand-typed inline PTX I have no way to compile-check here.
 
-**Next session, once Colab is reachable:** run `make build && make test`,
-confirm `test_m4_kernels.py` passes (especially the
-`test_w4a16_naive_and_lop3_agree` and basis-vector exact-dequant tests --
-those are the ones most likely to catch a bit-mapping mistake), then
-`make bench-m4` for the actual throughput numbers and the naive-vs-LOP3
-delta task 3 asks for.
+**Close-out: ran on a real T4 the same session.** `colab-mcp` reconnected
+(the earlier `CONNECT_TIMEOUT` was exactly the known slow-first-`uvx`
+issue -- pre-warming the `uv` cache locally with one direct invocation
+fixed it for the next session). Correctness: all 17 `test_m4_kernels.py`
+cases pass, including the exact-dequant basis-vector tests for both W8A16
+and W4A16, and `test_w4a16_naive_and_lop3_agree` (bit-exact, confirming the
+hand-derived LOP3 bit trick from the entry above is correct). Two real
+bugs surfaced by the T4 build/test run, not visible from local Python
+checks:
+- `gemv_w4a16_group.cuh`/`gemv_w8a16.cuh` used `uint8_t`/`int8_t` without
+  `#include <cstdint>` -- `cuda_fp16.h` alone doesn't pull it in, so nvcc
+  failed with "identifier undefined." Trivial once seen, invisible without
+  an actual nvcc invocation.
+- The ragged-K test (`K=4099`) passed the wrong K to the kernel: `formats.
+  quantize`'s `"group"` granularity zero-pads K up to a multiple of
+  `group_size` *before* `pack.pack_int4` ever sees it, so the packed
+  buffer is sized for the group-padded K (4224), not the original 4099.
+  The kernel's own `TORCH_CHECK` caught the mismatch correctly -- a test
+  bug, not a kernel bug, but a genuine "two independently-padded systems
+  composing for the first time" gotcha worth remembering when any future
+  code chains `formats.quantize` directly into `pack.pack_int4`.
+
+**Then a real performance bug, caught only by benchmarking.** First
+`bench-m4` run: 17/17 correctness tests green, but `gemv_w4a16_group_lop3`
+measured **0.99x** vs `gemv_fp16_v3` -- barely tied, despite moving 1/4 the
+bytes, and 10-20x slower than expected in raw GB/s. Root cause: the
+contiguous-per-lane K-chunking described above (meant to cache the group
+scale in a register) makes a warp's 32 simultaneous reads land hundreds of
+bytes apart instead of 32 consecutive words, destroying coalescing --
+exactly the failure mode M1's `strided_copy.cu` exists to teach, walked
+right back into it while solving a different problem. Fixed by reverting
+to the lane-strided access pattern from `gemv_fp16_v2/v3` (all 32 lanes'
+reads in one iteration are 32 consecutive words) and hoisting the scale
+load to once-per-word instead of once-per-group; correctness held (17/17
+again) and throughput jumped to **1.7-1.9x** (run-to-run noise at this
+problem size; `reports/m4_gemv_throughput.csv` has the full sweep).
+
+Tried two further optimizations to close the gap to the spec's 3x bar,
+both measured, neither kept:
+- **More warps per block** (4 -> 8): no measurable change (1.73x vs
+  1.74x) -- occupancy isn't the bottleneck here.
+- **Wider per-lane reads** (`uint4` = 4 packed words = 32 elements/lane
+  vs `uint32` = 8 elements/lane, to match `gemv_fp16_v3`'s 16-byte
+  transactions): *regressed* to 1.62x. The wider weight read stays
+  coalesced (lane `l`'s `uint4` index is still `l + 32*iter`), but getting
+  32 elements per lane per iteration instead of 8 means the matching `x`
+  reads (needed once per sub-word) are no longer coalesced across lanes
+  (stride-4 `float4` reads), and that cost more than the wider weight
+  transaction saved. Reverted cleanly (`git checkout --`) back to the
+  1.7-1.9x version.
+
+**Where that leaves M4:** numerics are solid (both acceptance-criteria
+tests pass: dequant matches the M3 reference exactly, GEMV output matches
+within 1e-2). Throughput does **not** meet the spec's "W4A16 >= 3x FP16 at
+K=N=4096" bar -- it lands at 1.7-1.9x. The spec's own text calls 3x "a
+realistic yield after overheads" off an ideal 4x; here overhead (per-
+element unpack/decode work, and a memory-transaction size for INT4 that's
+inherently 4x narrower than FP16's per the format itself) is eating more
+than that framing anticipated. Closing this gap for real (rather than by
+guessing-and-benchmarking one change at a time, which is what the two
+failed attempts above were) needs Nsight Compute -- achieved occupancy,
+memory throughput %, warp stall reasons -- which is explicitly M9's job
+in PROJECT_SPEC.md, not M4's. Recorded here as an open gap rather than
+quietly declared "done": M4's kernels are correct and meaningfully faster
+than FP16 (a legitimate, real result), but the 3x acceptance bar is
+unmet and that's the honest number to carry forward.
