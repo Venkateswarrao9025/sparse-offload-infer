@@ -365,28 +365,40 @@ Colab is reachable. Checklist boxes for GEMV/register-pressure etc. stay
 unchecked until a real run confirms the kernels are actually correct, not
 just argued to be.
 
-**Why contiguous per-lane chunks instead of the usual lane-strided split.**
-Every FP16 GEMV so far (`gemv_fp16_v2/v3`) splits K across a warp's 32
-lanes by *stride* (`for k = lane; k < K; k += 32`) -- each lane touches
-elements 32 apart, which is fine when every element's dequant is
-independent (no shared per-group state). Grouped quantization breaks that:
-a scale is shared across `group_size` *consecutive* K elements, and M4
-task 2 explicitly calls out re-reading that scale from global memory once
-per *element* as "the classic performance bug." A lane-strided loop makes
-that bug structural -- consecutive iterations of one lane land in
-different groups almost every time (at K=4096, group_size=128, a
-lane-strided loop jumps 32 elements/iteration, so it crosses a 128-wide
-group boundary roughly every 4 iterations, and worse, never revisits the
-same group across its whole traversal). Switching each lane to own one
-*contiguous* chunk of K (`gemv_w8a16`/`gemv_w4a16_group` here) means a
-lane's chunk can be sized to land inside as few groups as possible -- at
-the canonical benchmark shape (K=N=4096, group_size=128) it works out
-exactly: `4096 / 32 lanes = 128 = group_size`, so each lane's chunk *is*
-one group and the scale loads exactly once into a register (`s`, with a
-`last_group` guard for the general case where a chunk spans more than one
-group). This is a real design fork from the M2 GEMV pattern, not a
-variation of it -- worth remembering that "the fast layout" changes once a
-kernel has shared per-group state, not just per-element independent work.
+**First attempt at register-caching the group scale broke coalescing --
+caught by the benchmark, not the correctness tests.** The initial
+`gemv_w8a16`/`gemv_w4a16_group` gave each of a warp's 32 lanes a private
+*contiguous* chunk of K (instead of the usual `gemv_fp16_v2/v3` stride-32
+split), reasoning that grouped quantization shares one scale across
+`group_size` consecutive elements, and M4 task 2 explicitly calls out
+re-reading that scale from global memory once per *element* as "the
+classic performance bug" -- a contiguous chunk lets a lane's scale sit in
+one register across a whole group instead of reloading it. This passed
+every correctness test (17/17, including the exact-dequant basis-vector
+tests and naive-vs-LOP3 agreement) on the real T4, but `bench_m4.py`
+showed why correctness tests alone aren't enough: **10-20x SLOWER** than
+`gemv_fp16_v3` despite moving 1/4 to 1/8 the bytes (e.g. 12-24 GB/s vs
+FP16's ~240 GB/s). The bug: giving each lane a *private, far-apart* chunk
+of K means that within one warp instruction, the 32 lanes read addresses
+hundreds of bytes apart instead of 32 *consecutive* words -- exactly the
+coalescing collapse M1's `strided_copy.cu` was built to demonstrate, just
+reintroduced by accident while solving a different problem. Fixed by
+reverting to the standard lane-strided pattern (`for k4 = lane; k4 < K4;
+k4 += 32`, so all 32 lanes' reads in one iteration are 32 consecutive
+words = one coalesced transaction) and instead just hoisting the scale
+load to once-per-WORD (amortized over 4-8 elements) rather than once
+per scalar element. That's nowhere near as aggressive an amortization as
+"once per whole group," but it turns out coalescing dominates by an order
+of magnitude at this problem size -- the marginal extra scale reads (a
+tiny, L1/L2-resident array, and often a broadcast read since group_size is
+usually >= the elements-per-warp-iteration) cost essentially nothing next
+to a 10-20x memory-coalescing penalty. Lesson worth keeping: a
+"structural" optimization argued purely from re-read counts, without
+checking what it does to the access pattern of the much bigger tensor
+(the weights) sitting right next to it, can lose badly -- and the fix
+isn't visible from a correctness test, only from GB/s. (Benchmark results
+after the fix are below, in the M4 close-out entry once the run
+completes.)
 
 **Deriving the LOP3 dequant by adapting a published trick, not inventing
 one.** The well-known AWQ/FasterTransformer `dequantize_s4_to_fp16x2` bit

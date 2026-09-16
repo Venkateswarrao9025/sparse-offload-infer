@@ -9,16 +9,17 @@ constexpr int kThreadsPerBlock = kWarpsPerBlock * 32;
 constexpr int kInt4Group = 8;  // values packed per uint32, per layout.h
 }  // namespace
 
-// --- naive: scalar nibble unpack, one AWQ-group-of-8 (one uint32) at a time.
+// --- naive: scalar nibble unpack, lane-strided over int4-groups-of-8.
 //
-// K is split into 32 CONTIGUOUS per-lane chunks (each a whole number of
-// int4-groups) instead of the usual lane-strided split, so a lane's chunk
-// stays inside as few quant groups as possible: the group scale is loaded
-// once per group and kept in a register (`s`) across every element of that
-// group instead of being re-read from global memory per element
-// (PROJECT_SPEC.md M4 task 2's "classic performance bug"). At the canonical
-// benchmark shape (K=4096, group_size=128) this is exact: each lane's
-// 4096/32=128-element chunk IS one quant group, so the scale loads once.
+// Same access pattern as gemv_fp16_v2/v3 / gemv_w8a16: lane l reads word
+// l+32*iter, so all 32 lanes' reads in one iteration are 32 CONSECUTIVE
+// uint32 words -- one coalesced transaction. See gemv_w8a16.cu's comment
+// (and docs/LEARNING_NOTES.md's M4 entry) for why this replaced an earlier
+// contiguous-per-lane-chunk design that broke coalescing for a marginal
+// scale-caching win and measured far slower despite moving 1/4 the bytes.
+// The int4-packed buffer is already padded per-row to a whole number of
+// uint32 words (see layout.h), so unlike gemv_w8a16 there's no separate
+// scalar tail loop needed -- the last word's own `remaining` guard covers it.
 __global__ void gemv_w4a16_group_kernel(const uint8_t* __restrict__ Wq, const float* __restrict__ scale,
                                          const half* __restrict__ x, half* __restrict__ y, int N, int K,
                                          int group_size, int num_groups) {
@@ -31,21 +32,10 @@ __global__ void gemv_w4a16_group_kernel(const uint8_t* __restrict__ Wq, const fl
     const uint32_t* row_words = reinterpret_cast<const uint32_t*>(Wq) + static_cast<size_t>(row) * words_per_row;
     const float* srow = scale + static_cast<size_t>(row) * num_groups;
 
-    const int groups_total = words_per_row;
-    const int groups_per_lane = ceil_div(groups_total, 32);
-    const int g_start = lane * groups_per_lane;
-    const int g_end = min(g_start + groups_per_lane, groups_total);
-
     float acc = 0.0f;
-    int last_group = -1;
-    float s = 0.0f;
-    for (int w = g_start; w < g_end; ++w) {
+    for (int w = lane; w < words_per_row; w += 32) {
         const int k = w * kInt4Group;
-        const int group = k / group_size;
-        if (group != last_group) {
-            s = srow[group];
-            last_group = group;
-        }
+        const float s = srow[k / group_size];
         const uint32_t packed = row_words[w];
         int v[kInt4Group];
         v[0] = (packed >> 0) & 0xF;
@@ -79,10 +69,11 @@ void launch_gemv_w4a16_group(const uint8_t* Wq, const float* scale, const half* 
     CUDA_CHECK(cudaGetLastError());
 }
 
-// --- lop3: same partition/caching strategy, but dequantizes a whole
+// --- lop3: same lane-strided/coalesced access, but dequantizes a whole
 // int4-group (8 values) to half2x4 via dequant_int4x8_awq (dequant.cuh)
 // instead of scalar shift/mask/sign-extend, and loads x with one float4
-// (8-half) vectorized load instead of 8 scalar __half2float calls.
+// (8-half) vectorized load instead of 8 scalar __half2float calls -- lane l's
+// x4[w] read is likewise 32-lane coalesced (l and l+1 read adjacent float4s).
 __global__ void gemv_w4a16_group_lop3_kernel(const uint8_t* __restrict__ Wq, const float* __restrict__ scale,
                                               const half* __restrict__ x, half* __restrict__ y, int N, int K,
                                               int group_size, int num_groups) {
@@ -96,21 +87,10 @@ __global__ void gemv_w4a16_group_lop3_kernel(const uint8_t* __restrict__ Wq, con
     const float* srow = scale + static_cast<size_t>(row) * num_groups;
     const float4* x4 = reinterpret_cast<const float4*>(x);  // 8 halfs per float4
 
-    const int groups_total = words_per_row;
-    const int groups_per_lane = ceil_div(groups_total, 32);
-    const int g_start = lane * groups_per_lane;
-    const int g_end = min(g_start + groups_per_lane, groups_total);
-
     float acc = 0.0f;
-    int last_group = -1;
-    float s = 0.0f;
-    for (int w = g_start; w < g_end; ++w) {
+    for (int w = lane; w < words_per_row; w += 32) {
         const int k = w * kInt4Group;
-        const int group = k / group_size;
-        if (group != last_group) {
-            s = srow[group];
-            last_group = group;
-        }
+        const float s = srow[k / group_size];
         const uint32_t packed = row_words[w];
         half2 dq[4];
         dequant_int4x8_awq(packed, dq);
