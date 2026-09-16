@@ -121,21 +121,34 @@ def test_w4a16_dequant_exact_via_basis_vectors(gemv_fn_name, K):
 
 
 @pytest.mark.parametrize("gemv_fn_name", W4A16_FNS)
-@pytest.mark.parametrize("K", [4096, 4099])  # 4099: ragged tail, not a multiple of 8
+@pytest.mark.parametrize("K", [4096, 4099])  # 4099: not a multiple of group_size (128) or 8
 def test_w4a16_gemv_matches_reference(gemv_fn_name, K):
     torch.manual_seed(3)
     N, group_size = 512, 128
     W = torch.randn(N, K)
     qt = _quantize(4, W, "group", group_size)
-    Wq_packed, _ = pack.pack_int4(qt.qweight)
+    # formats.quantize's "group" granularity zero-pads K up to a multiple of
+    # group_size *before* pack_int4 ever sees it (see formats._amax_per_group)
+    # -- so what pack_int4 packs, and what our kernel's `K` must describe, is
+    # qt.qweight.shape[-1] (packed_k), not the true pre-quant K. The kernel's
+    # own K is a separate, smaller padding (up to a multiple of 8) on top of
+    # that; passing the true K here (4099) instead of packed_k (4224) is
+    # exactly the shape mismatch gemv_w4a16_group's TORCH_CHECK exists to
+    # catch, which is what caught this on first run against real hardware.
+    Wq_packed, packed_k = pack.pack_int4(qt.qweight)
     Wq_packed = Wq_packed.cuda()
     scale = qt.scale.cuda()
-    W_dequant = formats.dequantize(qt).cuda()
+    W_dequant = formats.dequantize(qt).cuda()  # truncated back to true K
 
-    x = torch.randn(K, device="cuda", dtype=torch.float16)
-    expected = torch.mv(W_dequant.float(), x.float()).half()
+    # x is sized to packed_k (what the kernel call requires); only the first
+    # K elements matter for the dot product since dequantized weight columns
+    # K..packed_k-1 are exactly zero (group-padding), so slicing x to K
+    # before the reference matmul is mathematically equivalent regardless of
+    # what's in the padding tail.
+    x = torch.randn(packed_k, device="cuda", dtype=torch.float16)
+    expected = torch.mv(W_dequant.float(), x[:K].float()).half()
     gemv_fn = getattr(soinfer.ops, gemv_fn_name)
-    actual = gemv_fn(Wq_packed, scale, x, K, group_size)
+    actual = gemv_fn(Wq_packed, scale, x, packed_k, group_size)
     assert_gemv_matches(actual, expected, f"{gemv_fn_name}[K={K}]")
 
 
