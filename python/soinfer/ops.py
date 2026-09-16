@@ -87,3 +87,23 @@ def gemv_fp16_v3(W: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 def gemv_fp16_v4_splitk(W: torch.Tensor, x: torch.Tensor, split: int) -> torch.Tensor:
     """y = W @ x. v4: split-K with atomics -- helps when N is too small to saturate the GPU. M2."""
     return _C.gemv_fp16_v4_splitk(W, x, split)
+
+
+def gemv_w8a16(Wq: torch.Tensor, scale: torch.Tensor, x: torch.Tensor, group_size: int) -> torch.Tensor:
+    """y = dequant(Wq, scale) @ x. Wq: [N,K] int8 (symmetric, see soinfer.quant.formats). scale: [N,num_groups]
+    or [1,num_groups] fp32 (broadcast for per_tensor). group_size: K for per_tensor/per_channel, else the
+    quant group size (scale[row, k // group_size] is used for element k). M4."""
+    return _C.gemv_w8a16(Wq, scale, x, group_size)
+
+
+def gemv_w4a16_group(Wq_packed: torch.Tensor, scale: torch.Tensor, x: torch.Tensor, K: int, group_size: int) -> torch.Tensor:
+    """y = dequant(Wq_packed, scale) @ x. Wq_packed: [N, ceil(K/8)*4] uint8, AWQ-order-packed INT4 (see
+    soinfer.quant.pack.pack_int4 / csrc/include/layout.h). scale: [N, num_groups] fp32, group_size a positive
+    multiple of 8. Scalar dequant, register-cached group scale. M4."""
+    return _C.gemv_w4a16_group(Wq_packed, scale, x, K, group_size)
+
+
+def gemv_w4a16_group_lop3(Wq_packed: torch.Tensor, scale: torch.Tensor, x: torch.Tensor, K: int, group_size: int) -> torch.Tensor:
+    """Same contract as gemv_w4a16_group, but dequantizes via FP16 bit-pattern construction instead of
+    int->float conversion instructions (PROJECT_SPEC.md M4 task 3). M4."""
+    return _C.gemv_w4a16_group_lop3(Wq_packed, scale, x, K, group_size)

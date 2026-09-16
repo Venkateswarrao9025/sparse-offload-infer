@@ -30,6 +30,8 @@ ext_modules = [
             os.path.join(CSRC_DIR, "kernels", "rmsnorm.cu"),
             os.path.join(CSRC_DIR, "kernels", "softmax_online.cu"),
             os.path.join(CSRC_DIR, "kernels", "gemv_fp16.cu"),
+            os.path.join(CSRC_DIR, "kernels", "gemv_w8a16.cu"),
+            os.path.join(CSRC_DIR, "kernels", "gemv_w4a16_group.cu"),
         ],
         include_dirs=[
             os.path.join(CSRC_DIR, "include"),

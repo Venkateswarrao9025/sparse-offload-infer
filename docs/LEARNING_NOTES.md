@@ -350,3 +350,80 @@ Lesson: a synthetic stress test can correctly demonstrate a *mechanism*
 without its exact severity numbers transferring to a real model whose
 outlier structure differs -- which is exactly why M3 task 4 asked for the
 real number rather than treating the synthetic table as sufficient.
+
+### M4 -- quantized GEMV kernels (in progress)
+
+2026-09-16. Wrote `gemv_w8a16` and `gemv_w4a16_group` (+ a second
+LOP3-style dequant variant, `gemv_w4a16_group_lop3`) plus
+`tests/test_m4_kernels.py` and `bench/bench_m4.py`, all authored locally
+(this dev machine has no GPU -- see docs/DESIGN.md). **Not yet run on
+hardware** -- `colab-mcp` failed to connect this session (`CONNECT_TIMEOUT`
+on first `uvx` invocation, a known slow-first-connect issue per
+docs/DESIGN.md, not retried successfully within the session). Nothing in
+this entry is a verified result; it's a design record to pick up from once
+Colab is reachable. Checklist boxes for GEMV/register-pressure etc. stay
+unchecked until a real run confirms the kernels are actually correct, not
+just argued to be.
+
+**Why contiguous per-lane chunks instead of the usual lane-strided split.**
+Every FP16 GEMV so far (`gemv_fp16_v2/v3`) splits K across a warp's 32
+lanes by *stride* (`for k = lane; k < K; k += 32`) -- each lane touches
+elements 32 apart, which is fine when every element's dequant is
+independent (no shared per-group state). Grouped quantization breaks that:
+a scale is shared across `group_size` *consecutive* K elements, and M4
+task 2 explicitly calls out re-reading that scale from global memory once
+per *element* as "the classic performance bug." A lane-strided loop makes
+that bug structural -- consecutive iterations of one lane land in
+different groups almost every time (at K=4096, group_size=128, a
+lane-strided loop jumps 32 elements/iteration, so it crosses a 128-wide
+group boundary roughly every 4 iterations, and worse, never revisits the
+same group across its whole traversal). Switching each lane to own one
+*contiguous* chunk of K (`gemv_w8a16`/`gemv_w4a16_group` here) means a
+lane's chunk can be sized to land inside as few groups as possible -- at
+the canonical benchmark shape (K=N=4096, group_size=128) it works out
+exactly: `4096 / 32 lanes = 128 = group_size`, so each lane's chunk *is*
+one group and the scale loads exactly once into a register (`s`, with a
+`last_group` guard for the general case where a chunk spans more than one
+group). This is a real design fork from the M2 GEMV pattern, not a
+variation of it -- worth remembering that "the fast layout" changes once a
+kernel has shared per-group state, not just per-element independent work.
+
+**Deriving the LOP3 dequant by adapting a published trick, not inventing
+one.** The well-known AWQ/FasterTransformer `dequantize_s4_to_fp16x2` bit
+trick (mask a 4-bit field into an FP16 mantissa next to a power-of-two
+exponent, so the *bit pattern itself* already encodes `1024 + nibble`, then
+one `sub`/`fma` per half2 recovers the value with no int->float conversion
+instruction) assumes nibbles are **unsigned** `[0,15]` with the sign
+recovered via a flat `-8` (a zero-point-8 convention). This project's
+`layout.h` packing is plain two's-complement signed 4-bit instead
+(`sign_extend(n) = n<8 ? n : n-16`). Worked out by hand (see
+`csrc/kernels/dequant.cuh`'s comment) that the two conventions agree after
+XOR-ing every nibble's sign bit first: `sign_extend(n) == (n ^ 8) - 8` for
+all 16 values of `n` (checked both branches concretely, e.g. `n=8`: ours
+gives `8-16=-8`, `(8^8)-8 = 0-8 = -8` ✓.) So the plan is: XOR the whole
+packed 32-bit word with `0x88888888` up front (one cheap, obviously-correct
+op, not part of the risky bit-magic), then run the *unmodified* published
+sequence, which is reassuring because that sequence is widely used in
+production (AWQ, FasterTransformer, vLLM) rather than something hand-rolled
+here. Also worked out, by tracing `AWQ_ORDER = [0,2,4,6,1,3,5,7]` against
+the trick's own nibble grouping, that the trick's four output half2 lanes
+land on `(v0,v1)`, `(v2,v3)`, `(v4,v5)`, `(v6,v7)` -- four *consecutive*
+pairs along K, needing no shuffling before pairing with a plain contiguous
+`float4` load of `x`. That confluence (AWQ's packing order + AWQ's dequant
+trick happening to compose with zero extra shuffling) is exactly what
+layout.h predicted back in M3 ("this is what makes the LOP3 dequant trick
+work") -- satisfying to see the payoff materialize, though it still needs a
+real GPU run to confirm the derivation didn't miss something. Implemented
+via CUDA C half2 intrinsics (`__hsub2`/`__hfma2`) rather than hand-written
+`asm volatile("lop3.b32 ...")`, deliberately: functionally the same
+bit-pattern-construction technique the spec asks for, but the intrinsic
+form is something I can actually reason about (and expect nvcc to lower to
+real `LOP3.LUT` instructions on Turing where profitable) without betting
+correctness on hand-typed inline PTX I have no way to compile-check here.
+
+**Next session, once Colab is reachable:** run `make build && make test`,
+confirm `test_m4_kernels.py` passes (especially the
+`test_w4a16_naive_and_lop3_agree` and basis-vector exact-dequant tests --
+those are the ones most likely to catch a bit-mapping mistake), then
+`make bench-m4` for the actual throughput numbers and the naive-vs-LOP3
+delta task 3 asks for.

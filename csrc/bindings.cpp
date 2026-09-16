@@ -3,6 +3,8 @@
 
 #include "kernels/elementwise.cuh"
 #include "kernels/gemv_fp16.cuh"
+#include "kernels/gemv_w4a16_group.cuh"
+#include "kernels/gemv_w8a16.cuh"
 #include "kernels/reduce_demo.cuh"
 #include "kernels/rmsnorm.cuh"
 #include "kernels/softmax_online.cuh"
@@ -190,6 +192,91 @@ torch::Tensor gemv_fp16_v4_splitk(torch::Tensor W, torch::Tensor x, int64_t spli
     return y_accum.to(torch::kFloat16);
 }
 
+namespace {
+
+// scale: [N, num_groups] fp32, or [1, num_groups] to broadcast one scale row
+// to every output row (per_tensor). *num_groups/*scale_row_stride are set on
+// return.
+void check_quant_scale(const torch::Tensor& scale, int64_t N, const char* name, int64_t* num_groups,
+                        int64_t* scale_row_stride) {
+    TORCH_CHECK(scale.is_cuda(), name, ": scale must be a CUDA tensor");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32, name, ": scale must be float32");
+    TORCH_CHECK(scale.is_contiguous(), name, ": scale must be contiguous");
+    TORCH_CHECK(scale.dim() == 2, name, ": scale must be 2D [N or 1, num_groups]");
+    TORCH_CHECK(scale.size(0) == N || scale.size(0) == 1, name,
+                ": scale.size(0) must be N (per-channel/group) or 1 (per-tensor broadcast)");
+    *num_groups = scale.size(1);
+    *scale_row_stride = (scale.size(0) == 1) ? 0 : *num_groups;
+}
+
+}  // namespace
+
+torch::Tensor gemv_w8a16(torch::Tensor Wq, torch::Tensor scale, torch::Tensor x, int64_t group_size) {
+    TORCH_CHECK(Wq.is_cuda(), "gemv_w8a16(Wq): must be a CUDA tensor");
+    TORCH_CHECK(Wq.scalar_type() == torch::kInt8, "gemv_w8a16(Wq): must be int8");
+    TORCH_CHECK(Wq.is_contiguous(), "gemv_w8a16(Wq): must be contiguous");
+    TORCH_CHECK(Wq.dim() == 2, "gemv_w8a16(Wq): must be 2D [N, K]");
+    check_f16_cuda_contiguous(x, "gemv_w8a16(x)");
+    TORCH_CHECK(x.dim() == 1 && x.size(0) == Wq.size(1), "gemv_w8a16: x must be 1D [K] matching Wq's K");
+    TORCH_CHECK(group_size >= 1, "gemv_w8a16: group_size must be >= 1");
+
+    const int64_t N = Wq.size(0), K = Wq.size(1);
+    int64_t num_groups = 0, scale_row_stride = 0;
+    check_quant_scale(scale, N, "gemv_w8a16", &num_groups, &scale_row_stride);
+    TORCH_CHECK(num_groups == 1 || group_size % 4 == 0, "gemv_w8a16: group_size must be a multiple of 4 when "
+                                                          "num_groups > 1 (kernel reads 4 packed int8 per uint32 "
+                                                          "word and must never span two quant groups)");
+    auto y = torch::empty({N}, x.options());
+    launch_gemv_w8a16(Wq.data_ptr<int8_t>(), scale.data_ptr<float>(), half_ptr(x), half_ptr(y),
+                       static_cast<int>(N), static_cast<int>(K), static_cast<int>(group_size),
+                       static_cast<int>(num_groups), static_cast<int>(scale_row_stride));
+    return y;
+}
+
+namespace {
+
+torch::Tensor gemv_w4a16_group_impl(torch::Tensor Wq_packed, torch::Tensor scale, torch::Tensor x, int64_t K,
+                                     int64_t group_size, const char* name,
+                                     void (*launcher)(const uint8_t*, const float*, const half*, half*, int, int,
+                                                       int, int)) {
+    TORCH_CHECK(Wq_packed.is_cuda(), name, "(Wq_packed): must be a CUDA tensor");
+    TORCH_CHECK(Wq_packed.scalar_type() == torch::kUInt8, name, "(Wq_packed): must be uint8 (AWQ-packed int4)");
+    TORCH_CHECK(Wq_packed.is_contiguous(), name, "(Wq_packed): must be contiguous");
+    TORCH_CHECK(Wq_packed.dim() == 2, name, "(Wq_packed): must be 2D [N, ceil(K/8)*4]");
+    check_f16_cuda_contiguous(x, "x");
+    TORCH_CHECK(x.dim() == 1 && x.size(0) == K, name, ": x must be 1D [K]");
+    TORCH_CHECK(K >= 1, name, ": K must be >= 1");
+    TORCH_CHECK(group_size >= 1 && group_size % 8 == 0, name, ": group_size must be a positive multiple of 8");
+
+    const int64_t N = Wq_packed.size(0);
+    const int64_t expected_bytes = ((K + 7) / 8) * 4;
+    TORCH_CHECK(Wq_packed.size(1) == expected_bytes, name, ": Wq_packed.size(1) must be ceil(K/8)*4 for the given K");
+    TORCH_CHECK(scale.is_cuda(), name, ": scale must be a CUDA tensor");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32, name, ": scale must be float32");
+    TORCH_CHECK(scale.is_contiguous(), name, ": scale must be contiguous");
+    TORCH_CHECK(scale.dim() == 2 && scale.size(0) == N, name,
+                ": scale must be 2D [N, num_groups] (grouped int4 has no per-tensor broadcast)");
+    const int64_t num_groups = scale.size(1);
+
+    auto y = torch::empty({N}, x.options());
+    launcher(Wq_packed.data_ptr<uint8_t>(), scale.data_ptr<float>(), half_ptr(x), half_ptr(y),
+             static_cast<int>(N), static_cast<int>(K), static_cast<int>(group_size), static_cast<int>(num_groups));
+    return y;
+}
+
+}  // namespace
+
+torch::Tensor gemv_w4a16_group(torch::Tensor Wq_packed, torch::Tensor scale, torch::Tensor x, int64_t K,
+                                int64_t group_size) {
+    return gemv_w4a16_group_impl(Wq_packed, scale, x, K, group_size, "gemv_w4a16_group", launch_gemv_w4a16_group);
+}
+
+torch::Tensor gemv_w4a16_group_lop3(torch::Tensor Wq_packed, torch::Tensor scale, torch::Tensor x, int64_t K,
+                                     int64_t group_size) {
+    return gemv_w4a16_group_impl(Wq_packed, scale, x, K, group_size, "gemv_w4a16_group_lop3",
+                                  launch_gemv_w4a16_group_lop3);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("add_one", &add_one, "Add 1.0 to every element of a float32 CUDA tensor (M0 toolchain smoke test)");
     m.def("vector_add", &vector_add, "out = a + b, elementwise (M1)");
@@ -208,4 +295,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemv_fp16_v2", &gemv_fp16_v2, "FP16 GEMV v2: one warp per row, shuffle reduce (M2)");
     m.def("gemv_fp16_v3", &gemv_fp16_v3, "FP16 GEMV v3: v2 + float4-vectorized loads (M2)");
     m.def("gemv_fp16_v4_splitk", &gemv_fp16_v4_splitk, "FP16 GEMV v4: split-K with atomics (M2)");
+    m.def("gemv_w8a16", &gemv_w8a16, "W8A16 GEMV: symmetric INT8 weights, FP16 activations (M4)");
+    m.def("gemv_w4a16_group", &gemv_w4a16_group,
+          "W4A16 grouped GEMV: AWQ-packed INT4 weights, scalar dequant, register-cached group scale (M4)");
+    m.def("gemv_w4a16_group_lop3", &gemv_w4a16_group_lop3,
+          "W4A16 grouped GEMV: same as gemv_w4a16_group but with bit-pattern-construction INT4->FP16 dequant (M4)");
 }
