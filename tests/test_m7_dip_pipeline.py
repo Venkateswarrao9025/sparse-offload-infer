@@ -88,7 +88,7 @@ def _build_synthetic_dip_model(seed: int = 0) -> gen.StreamingModel:
         store=store, matrices=matrices, num_layers=NUM_LAYERS, embed_tokens=embed_tokens, lm_head=lm_head,
         final_norm=final_norm, layer_norms=layer_norms, hidden_size=H,
         num_attention_heads=CFG["num_attention_heads"], num_key_value_heads=CFG["num_key_value_heads"],
-        head_dim=CFG["head_dim"], rms_norm_eps=1e-6, rope_theta=1_000_000.0,
+        head_dim=CFG["head_dim"], rms_norm_eps=1e-6, rope_theta=1_000_000.0, group_size=GROUP_SIZE,
     )
 
 

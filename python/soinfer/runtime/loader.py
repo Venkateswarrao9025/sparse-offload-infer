@@ -78,4 +78,5 @@ def load_streaming_model(model_dir: str, group_size: int = 128, include_dip: boo
         head_dim=config["head_dim"],
         rms_norm_eps=config["rms_norm_eps"],
         rope_theta=float(config["rope_theta"]),
+        group_size=group_size,
     )

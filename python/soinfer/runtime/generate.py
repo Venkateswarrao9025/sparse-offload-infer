@@ -29,7 +29,15 @@ from soinfer.offload.load_hf_checkpoint import DOWN_PROJ_T_SUFFIX, LINEAR_SUFFIX
 from soinfer.offload.stream_manager import StreamManager
 from soinfer.offload.weight_store import PinnedWeightStore
 
-GROUP_SIZE = 128
+# NOTE: no module-level GROUP_SIZE constant here on purpose -- every GEMV
+# call below reads model.group_size instead, since it must match whatever
+# group_size the specific model's arena was actually quantized with
+# (StreamingModel.group_size). A hardcoded constant here previously caused
+# a real, if latent, bug: it silently ignored load_streaming_model's own
+# group_size parameter, so loading with anything other than 128 would
+# mis-index the scale array. Caught by M7 task 4's integration test using
+# a small synthetic model quantized with group_size=32 -- see
+# LEARNING_NOTES.md's M7 task 4 entry.
 
 # M7: the 5 weights that stay fully dense-streamed even in the DIP decode
 # path (gate_proj must run dense -- selection needs |gate_out| for every
@@ -67,6 +75,7 @@ class StreamingModel:
     head_dim: int
     rms_norm_eps: float
     rope_theta: float
+    group_size: int = 128  # must match whatever group_size the arena's weights were quantized with
 
     def __post_init__(self) -> None:
         self.stream_manager = StreamManager(num_buffers=2)
@@ -114,7 +123,7 @@ class WeightPipeline:
         self.sm.wait(self.cur_buf)
         nbytes = m.n * m.handle.row_nbytes
         view = self.bufs[self.cur_buf][:nbytes].view(m.n, m.handle.row_nbytes)
-        result = ops.gemv_w4a16_group_lop3(view, m.scale, x_in, m.packed_k, GROUP_SIZE)
+        result = ops.gemv_w4a16_group_lop3(view, m.scale, x_in, m.packed_k, self.model.group_size)
 
         next_buf = 1 - self.cur_buf
         next_name = next(self._names)
@@ -265,13 +274,13 @@ def run_decoder_layer_dip(
     torch.cuda.synchronize()  # both gathers must land before the sparse GEMVs below read them
 
     up_scale_sel = up_lm.scale.index_select(0, idx_long)
-    u_selected = ops.gemv_w4a16_group_lop3(up_gpu, up_scale_sel, h3, up_lm.packed_k, GROUP_SIZE)
+    u_selected = ops.gemv_w4a16_group_lop3(up_gpu, up_scale_sel, h3, up_lm.packed_k, model.group_size)
 
     g_selected = gate.index_select(0, idx_long)
     h_selected = (F.silu(g_selected.float()) * u_selected.float()).half()
 
     downT_scale_sel = downT_lm.scale.index_select(0, idx_long)
-    down_out = ops.gemv_w4a16_sparse_accumulate(down_gpu, downT_scale_sel, h_selected, model.hidden_size, GROUP_SIZE)
+    down_out = ops.gemv_w4a16_sparse_accumulate(down_gpu, downT_scale_sel, h_selected, model.hidden_size, model.group_size)
 
     return residual2 + down_out
 
