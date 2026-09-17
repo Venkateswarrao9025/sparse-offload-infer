@@ -11,4 +11,11 @@ except ImportError:
     # actually called.
     ops = None
 
-__all__ = ["ops", "quant", "offload"]
+try:
+    from . import runtime
+except ImportError:
+    # runtime.generate needs both soinfer.ops and soinfer.offload.load_hf_checkpoint
+    # (safetensors) -- see their own None-guards for why.
+    runtime = None
+
+__all__ = ["ops", "quant", "offload", "runtime"]

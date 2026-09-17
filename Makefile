@@ -1,4 +1,4 @@
-.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 profile clean
+.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline profile clean
 
 # --no-build-isolation: link against the torch already installed in this
 # environment (e.g. Colab's preinstalled torch+cu121) instead of pip building
@@ -28,6 +28,11 @@ bench-m4:
 
 bench-m6:
 	python bench/bench_m6_roofline.py
+
+# Not part of `make bench` -- downloads a 14B model (~28GB) and takes
+# several minutes. Run explicitly: `make bench-m6-headline`.
+bench-m6-headline:
+	python bench/bench_m6_headline_model.py
 
 profile:
 	nsys profile -o reports/profile python bench/bench_pcie.py
