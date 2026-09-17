@@ -1,4 +1,4 @@
-.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 profile clean
+.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 profile clean
 
 # --no-build-isolation: link against the torch already installed in this
 # environment (e.g. Colab's preinstalled torch+cu121) instead of pip building
@@ -9,7 +9,7 @@ build:
 test:
 	pytest tests/ -v
 
-bench: bench-pcie bench-baseline bench-m1 bench-m2 bench-m4
+bench: bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6
 
 bench-pcie:
 	python bench/bench_pcie.py
@@ -25,6 +25,9 @@ bench-m2:
 
 bench-m4:
 	python bench/bench_m4.py
+
+bench-m6:
+	python bench/bench_m6_roofline.py
 
 profile:
 	nsys profile -o reports/profile python bench/bench_pcie.py
