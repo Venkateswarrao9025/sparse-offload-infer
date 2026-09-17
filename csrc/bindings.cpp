@@ -8,6 +8,7 @@
 #include "kernels/decode_attention.cuh"
 #include "kernels/elementwise.cuh"
 #include "kernels/gather_rows.cuh"
+#include "kernels/gemv_dip_fused.cuh"
 #include "kernels/gemv_fp16.cuh"
 #include "kernels/gemv_sparse_accumulate.cuh"
 #include "kernels/gemv_w4a16_group.cuh"
@@ -315,6 +316,93 @@ torch::Tensor gemv_w4a16_sparse_accumulate(torch::Tensor Wq_selected, torch::Ten
     return y;
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> build_dip_descriptors(torch::Tensor selected_indices,
+                                                                               torch::Tensor slot_of) {
+    const char* name = "build_dip_descriptors";
+    TORCH_CHECK(selected_indices.is_cuda() && selected_indices.scalar_type() == torch::kInt32 &&
+                    selected_indices.dim() == 1 && selected_indices.is_contiguous(),
+                name, "(selected_indices): must be a contiguous 1D int32 CUDA tensor");
+    TORCH_CHECK(slot_of.is_cuda() && slot_of.scalar_type() == torch::kInt32 && slot_of.dim() == 1 &&
+                    slot_of.is_contiguous(),
+                name, "(slot_of): must be a contiguous 1D int32 CUDA tensor");
+
+    const int64_t k = selected_indices.size(0);
+    auto descriptors = torch::empty({k}, selected_indices.options());
+    auto miss_channels = torch::empty({k}, selected_indices.options());
+    auto miss_count = torch::empty({1}, selected_indices.options());
+    launch_build_dip_descriptors(selected_indices.data_ptr<int32_t>(), static_cast<int>(k),
+                                  slot_of.data_ptr<int32_t>(), descriptors.data_ptr<int32_t>(),
+                                  miss_channels.data_ptr<int32_t>(), miss_count.data_ptr<int32_t>());
+    return {descriptors, miss_channels, miss_count};
+}
+
+namespace {
+
+void check_dip_fused_common(const torch::Tensor& cache_Wq, const torch::Tensor& cache_scale,
+                             const torch::Tensor& staging_Wq, const torch::Tensor& staging_scale,
+                             const torch::Tensor& descriptors, int64_t row_dim, const char* name) {
+    const int64_t expected_bytes = ((row_dim + 7) / 8) * 4;
+    TORCH_CHECK(cache_Wq.is_cuda() && cache_Wq.scalar_type() == torch::kUInt8 && cache_Wq.dim() == 2 &&
+                    cache_Wq.is_contiguous() && cache_Wq.size(1) == expected_bytes,
+                name, "(cache_Wq): must be a contiguous 2D uint8 CUDA tensor [C, ceil(row_dim/8)*4]");
+    TORCH_CHECK(staging_Wq.is_cuda() && staging_Wq.scalar_type() == torch::kUInt8 && staging_Wq.dim() == 2 &&
+                    staging_Wq.is_contiguous() && staging_Wq.size(1) == expected_bytes,
+                name, "(staging_Wq): must be a contiguous 2D uint8 CUDA tensor [M, ceil(row_dim/8)*4]");
+    TORCH_CHECK(cache_scale.is_cuda() && cache_scale.scalar_type() == torch::kFloat32 && cache_scale.dim() == 2 &&
+                    cache_scale.is_contiguous(),
+                name, "(cache_scale): must be a contiguous 2D float32 CUDA tensor [C, num_groups]");
+    TORCH_CHECK(staging_scale.is_cuda() && staging_scale.scalar_type() == torch::kFloat32 &&
+                    staging_scale.dim() == 2 && staging_scale.is_contiguous(),
+                name, "(staging_scale): must be a contiguous 2D float32 CUDA tensor [M, num_groups]");
+    TORCH_CHECK(cache_scale.size(1) == staging_scale.size(1), name,
+                ": cache_scale and staging_scale must have the same num_groups");
+    TORCH_CHECK(descriptors.is_cuda() && descriptors.scalar_type() == torch::kInt32 && descriptors.dim() == 1 &&
+                    descriptors.is_contiguous(),
+                name, "(descriptors): must be a contiguous 1D int32 CUDA tensor");
+}
+
+}  // namespace
+
+torch::Tensor gemv_dip_fused_up(torch::Tensor cache_Wq, torch::Tensor cache_scale, torch::Tensor staging_Wq,
+                                 torch::Tensor staging_scale, torch::Tensor descriptors, torch::Tensor x, int64_t K,
+                                 int64_t group_size) {
+    const char* name = "gemv_dip_fused_up";
+    check_dip_fused_common(cache_Wq, cache_scale, staging_Wq, staging_scale, descriptors, K, name);
+    check_f16_cuda_contiguous(x, "gemv_dip_fused_up(x)");
+    TORCH_CHECK(x.dim() == 1 && x.size(0) == K, name, ": x must be 1D [K]");
+    TORCH_CHECK(group_size >= 1 && group_size % 8 == 0, name, ": group_size must be a positive multiple of 8");
+
+    const int64_t k = descriptors.size(0);
+    const int64_t num_groups = cache_scale.size(1);
+    auto y = torch::empty({k}, x.options());
+    launch_gemv_dip_fused_up(cache_Wq.data_ptr<uint8_t>(), cache_scale.data_ptr<float>(),
+                              staging_Wq.data_ptr<uint8_t>(), staging_scale.data_ptr<float>(),
+                              descriptors.data_ptr<int32_t>(), half_ptr(x), half_ptr(y), static_cast<int>(k),
+                              static_cast<int>(K), static_cast<int>(group_size), static_cast<int>(num_groups));
+    return y;
+}
+
+torch::Tensor gemv_dip_fused_down(torch::Tensor cache_Wq, torch::Tensor cache_scale, torch::Tensor staging_Wq,
+                                   torch::Tensor staging_scale, torch::Tensor descriptors, torch::Tensor h_selected,
+                                   int64_t H, int64_t group_size) {
+    const char* name = "gemv_dip_fused_down";
+    check_dip_fused_common(cache_Wq, cache_scale, staging_Wq, staging_scale, descriptors, H, name);
+    check_f16_cuda_contiguous(h_selected, "gemv_dip_fused_down(h_selected)");
+    const int64_t k = descriptors.size(0);
+    TORCH_CHECK(h_selected.dim() == 1 && h_selected.size(0) == k, name, ": h_selected must be 1D [k]");
+    TORCH_CHECK(H >= 1, name, ": H must be >= 1");
+    TORCH_CHECK(group_size >= 1 && group_size % 8 == 0, name, ": group_size must be a positive multiple of 8");
+
+    const int64_t num_groups = cache_scale.size(1);
+    auto y = torch::empty({H}, h_selected.options());
+    launch_gemv_dip_fused_down(cache_Wq.data_ptr<uint8_t>(), cache_scale.data_ptr<float>(),
+                                staging_Wq.data_ptr<uint8_t>(), staging_scale.data_ptr<float>(),
+                                descriptors.data_ptr<int32_t>(), half_ptr(h_selected), half_ptr(y),
+                                static_cast<int>(H), static_cast<int>(k), static_cast<int>(group_size),
+                                static_cast<int>(num_groups));
+    return y;
+}
+
 torch::Tensor swiglu_gate_up(torch::Tensor gate_W, torch::Tensor up_W, torch::Tensor x) {
     check_f16_cuda_contiguous(gate_W, "swiglu_gate_up(gate_W)");
     check_f16_cuda_contiguous(up_W, "swiglu_gate_up(up_W)");
@@ -468,6 +556,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemv_w4a16_sparse_accumulate", &gemv_w4a16_sparse_accumulate,
           "Sparse 'down' GEMV: y[H] = sum_i h[i] * W_T[i,:] over k selected (already row-gathered) rows of a "
           "transposed-stored down_proj (M7)");
+    m.def("build_dip_descriptors", &build_dip_descriptors,
+          "Resolves each selected channel to a (cache slot | staging miss-position) descriptor, compacting misses "
+          "for a targeted gather (M8)");
+    m.def("gemv_dip_fused_up", &gemv_dip_fused_up,
+          "Descriptor-driven 'up' GEMV: reads each selected row from either the resident cache or the staging "
+          "buffer in one pass, no host branching (M8)");
+    m.def("gemv_dip_fused_down", &gemv_dip_fused_down,
+          "Descriptor-driven 'down' GEMV: same cache-or-stream fusion as gemv_dip_fused_up, for the transposed-"
+          "storage accumulate direction (M8)");
     m.def("swiglu_gate_up", &swiglu_gate_up,
           "Fused SwiGLU gate+up: h = silu(gate_W @ x) * (up_W @ x), one pass over x for both projections (M5)");
     m.def("kv_cache_append", &kv_cache_append,

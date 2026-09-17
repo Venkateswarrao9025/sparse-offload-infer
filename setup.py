@@ -39,6 +39,7 @@ ext_modules = [
             os.path.join(CSRC_DIR, "kernels", "topk_select.cu"),
             os.path.join(CSRC_DIR, "kernels", "gather_rows.cu"),
             os.path.join(CSRC_DIR, "kernels", "gemv_sparse_accumulate.cu"),
+            os.path.join(CSRC_DIR, "kernels", "gemv_dip_fused.cu"),
         ],
         include_dirs=[
             os.path.join(CSRC_DIR, "include"),

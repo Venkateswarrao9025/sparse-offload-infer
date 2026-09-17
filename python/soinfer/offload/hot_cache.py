@@ -26,9 +26,16 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Iterable, Sequence
 
 import torch
+
+if TYPE_CHECKING:
+    # Only for type hints -- soinfer.runtime.generate imports soinfer.ops
+    # at its own top level, which requires the compiled CUDA extension.
+    # A real (non-TYPE_CHECKING) import here would break this module's
+    # pure-CPU-simulation half's no-GPU importability.
+    from soinfer.runtime.generate import StreamingModel
 
 
 def _as_sorted_ints(selected: Sequence[int] | torch.Tensor) -> list[int]:
@@ -190,3 +197,90 @@ def compare_policies(
         results.append(LRUPolicy(cache_size).simulate(trace))
         results.append(LFUDecayPolicy(cache_size, **lfu_kwargs).simulate(trace))
     return results
+
+
+# ---------------------------------------------------------------------------
+# GPU-resident cache (needs CUDA + the compiled soinfer._C extension --
+# NOT YET HARDWARE-VERIFIED as of the commit that adds this, see
+# docs/LEARNING_NOTES.md's M8 task 3 entry for why).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HotCache:
+    """M8 task 2/3: the GPU-resident 'hot' channel cache the fused kernel
+    (M8 task 3, ops.gemv_dip_fused_up/_down) reads from. Built ONCE per
+    layer from a chosen set of hot channel indices -- typically
+    StaticFrequencyPolicy.hot_set, picked by comparing policies via
+    compare_policies above (see this module's docstring for why the two
+    ADAPTIVE policies, LRU/LFU-with-decay, stay simulation-only for now
+    rather than driving a real, continuously-updated GPU-resident cache:
+    that would mean evicting/reloading rows mid-serving, a substantially
+    bigger system than a cache fixed at calibration time).
+
+    Holds BOTH up_proj's and down_proj_T's rows for every hot channel
+    (both are needed to fully avoid a host gather for that channel), plus
+    `slot_of` -- a [intermediate_size] int32 GPU tensor mapping a channel
+    index to its cache slot (-1 if not cached) that
+    ops.build_dip_descriptors (M8 task 3) reads directly.
+    """
+
+    slot_of: torch.Tensor  # [I] int32 CUDA, -1 if channel c is not cached
+    hot_indices: torch.Tensor  # [C] int64 CUDA, ascending -- which channels are cached
+    up_Wq: torch.Tensor  # [C, up_row_nbytes] uint8 CUDA
+    up_scale: torch.Tensor  # [C, up_num_groups] float32 CUDA
+    down_Wq: torch.Tensor  # [C, down_row_nbytes] uint8 CUDA
+    down_scale: torch.Tensor  # [C, down_num_groups] float32 CUDA
+
+    @property
+    def cache_size(self) -> int:
+        return self.hot_indices.shape[0]
+
+    @staticmethod
+    def build(model: "StreamingModel", layer_idx: int, hot_indices: Sequence[int] | torch.Tensor) -> "HotCache":
+        """Gathers the given channels' up_proj/down_proj_T rows from the
+        pinned host arena into GPU-resident cache tensors, using
+        gather_rows_staged (M7 task 2) -- a ONE-TIME cost paid when the
+        cache is built, not per token (unlike the per-token staging
+        gather M7 task 4's DIP path pays for every selected channel,
+        cached or not -- this is exactly the cost M8 removes for
+        cache-resident channels)."""
+        # Local imports: keep this module's pure-CPU simulation half (the
+        # *Policy classes above) importable and runnable with no compiled
+        # CUDA extension and no safetensors install at all -- verified on
+        # a machine with neither.
+        import soinfer.ops as ops
+        from .load_hf_checkpoint import DOWN_PROJ_T_SUFFIX
+
+        if isinstance(hot_indices, torch.Tensor):
+            hot_indices = torch.sort(hot_indices.long().cpu())[0]
+        else:
+            hot_indices = torch.tensor(sorted(int(c) for c in hot_indices), dtype=torch.int64)
+        C = hot_indices.shape[0]
+
+        I = model.matrices["model.layers.0.mlp.up_proj.weight"].n
+        slot_of = torch.full((I,), -1, dtype=torch.int32, device="cuda")
+        hot_indices_cuda = hot_indices.cuda()
+        slot_of[hot_indices_cuda] = torch.arange(C, dtype=torch.int32, device="cuda")
+
+        up_lm = model.matrices[f"model.layers.{layer_idx}.mlp.up_proj.weight"]
+        downT_lm = model.matrices[f"model.layers.{layer_idx}.{DOWN_PROJ_T_SUFFIX}"]
+
+        up_host = model.store.matrix_view(up_lm.handle)
+        up_staging = torch.empty(C, up_lm.handle.row_nbytes, dtype=torch.uint8).pin_memory()
+        up_gpu = torch.empty(C, up_lm.handle.row_nbytes, dtype=torch.uint8, device="cuda")
+        ops.gather_rows_staged(up_host, hot_indices, up_staging, up_gpu)
+
+        down_host = model.store.matrix_view(downT_lm.handle)
+        down_staging = torch.empty(C, downT_lm.handle.row_nbytes, dtype=torch.uint8).pin_memory()
+        down_gpu = torch.empty(C, downT_lm.handle.row_nbytes, dtype=torch.uint8, device="cuda")
+        ops.gather_rows_staged(down_host, hot_indices, down_staging, down_gpu)
+        torch.cuda.synchronize()  # both gathers must land before the cache is considered ready
+
+        up_scale = up_lm.scale.index_select(0, hot_indices_cuda)
+        down_scale = downT_lm.scale.index_select(0, hot_indices_cuda)
+
+        return HotCache(
+            slot_of=slot_of, hot_indices=hot_indices_cuda, up_Wq=up_gpu, up_scale=up_scale, down_Wq=down_gpu,
+            down_scale=down_scale,
+        )

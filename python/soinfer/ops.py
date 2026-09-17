@@ -188,6 +188,37 @@ def gemv_w4a16_sparse_accumulate(Wq_selected: torch.Tensor, scale_selected: torc
     return _C.gemv_w4a16_sparse_accumulate(Wq_selected, scale_selected, h_selected, H, group_size)
 
 
+def build_dip_descriptors(selected_indices: torch.Tensor, slot_of: torch.Tensor):
+    """M8 task 3: for each of the k channels top-k selection picked (selected_indices, int32
+    CUDA), resolves whether it's resident in the cache (slot_of[channel] >= 0) or needs a host
+    gather, producing a compacted descriptor per channel plus the list of channels that
+    actually need gathering (only the misses, not all k -- the real byte savings over M7 task
+    4's "gather all k every time" baseline). Returns (descriptors, miss_channels, miss_count);
+    only miss_channels[:miss_count.item()] is valid -- the rest of that k-sized buffer is
+    unused scratch space."""
+    return _C.build_dip_descriptors(selected_indices, slot_of)
+
+
+def gemv_dip_fused_up(cache_Wq: torch.Tensor, cache_scale: torch.Tensor, staging_Wq: torch.Tensor,
+                       staging_scale: torch.Tensor, descriptors: torch.Tensor, x: torch.Tensor,
+                       K: int, group_size: int) -> torch.Tensor:
+    """M8 task 3, 'up' direction: y[k] = W_selected @ x, reading each selected row from EITHER
+    the resident cache_Wq/cache_scale OR the freshly-gathered staging_Wq/staging_scale, chosen
+    per-row by its descriptor (build_dip_descriptors) -- one kernel, no host branching, no
+    second launch. Same numerics as gemv_w4a16_group_lop3 (M4) restricted to the selected set
+    (M7 task 3's reuse), just with a two-source row lookup instead of one fixed buffer."""
+    return _C.gemv_dip_fused_up(cache_Wq, cache_scale, staging_Wq, staging_scale, descriptors, x, K, group_size)
+
+
+def gemv_dip_fused_down(cache_Wq: torch.Tensor, cache_scale: torch.Tensor, staging_Wq: torch.Tensor,
+                         staging_scale: torch.Tensor, descriptors: torch.Tensor, h_selected: torch.Tensor,
+                         H: int, group_size: int) -> torch.Tensor:
+    """M8 task 3, 'down' direction: same cache-or-stream fusion as gemv_dip_fused_up, for the
+    transposed-storage weighted row-sum gemv_w4a16_sparse_accumulate (M7 task 3) computes."""
+    return _C.gemv_dip_fused_down(cache_Wq, cache_scale, staging_Wq, staging_scale, descriptors, h_selected, H,
+                                   group_size)
+
+
 def precompute_rope_cos_sin(head_dim: int, theta: float, pos: int, device, dtype=torch.float32):
     """cos/sin for RoPE at absolute position `pos`, matching HF's Qwen3RotaryEmbedding exactly:
     inv_freq[i] = 1/theta^(2i/head_dim) for i in [0, head_dim/2), angle_i = pos*inv_freq[i]. M5."""
