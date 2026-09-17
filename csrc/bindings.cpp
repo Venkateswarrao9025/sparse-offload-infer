@@ -9,6 +9,7 @@
 #include "kernels/elementwise.cuh"
 #include "kernels/gather_rows.cuh"
 #include "kernels/gemv_fp16.cuh"
+#include "kernels/gemv_sparse_accumulate.cuh"
 #include "kernels/gemv_w4a16_group.cuh"
 #include "kernels/gemv_w8a16.cuh"
 #include "kernels/kv_cache.cuh"
@@ -287,6 +288,33 @@ torch::Tensor gemv_w4a16_group_lop3(torch::Tensor Wq_packed, torch::Tensor scale
                                   launch_gemv_w4a16_group_lop3);
 }
 
+torch::Tensor gemv_w4a16_sparse_accumulate(torch::Tensor Wq_selected, torch::Tensor scale_selected,
+                                            torch::Tensor h_selected, int64_t H, int64_t group_size) {
+    const char* name = "gemv_w4a16_sparse_accumulate";
+    TORCH_CHECK(Wq_selected.is_cuda() && Wq_selected.scalar_type() == torch::kUInt8 && Wq_selected.is_contiguous(),
+                name, "(Wq_selected): must be a contiguous CUDA uint8 tensor");
+    TORCH_CHECK(Wq_selected.dim() == 2, name, "(Wq_selected): must be 2D [k, ceil(H/8)*4]");
+    TORCH_CHECK(H >= 1, name, ": H must be >= 1");
+    TORCH_CHECK(group_size >= 1 && group_size % 8 == 0, name, ": group_size must be a positive multiple of 8");
+
+    const int64_t k = Wq_selected.size(0);
+    const int64_t expected_bytes = ((H + 7) / 8) * 4;
+    TORCH_CHECK(Wq_selected.size(1) == expected_bytes, name, ": Wq_selected.size(1) must be ceil(H/8)*4 for the given H");
+    TORCH_CHECK(scale_selected.is_cuda() && scale_selected.scalar_type() == torch::kFloat32 && scale_selected.is_contiguous(),
+                name, "(scale_selected): must be a contiguous CUDA float32 tensor");
+    TORCH_CHECK(scale_selected.dim() == 2 && scale_selected.size(0) == k, name,
+                ": scale_selected must be 2D [k, num_groups]");
+    check_f16_cuda_contiguous(h_selected, "gemv_w4a16_sparse_accumulate(h_selected)");
+    TORCH_CHECK(h_selected.dim() == 1 && h_selected.size(0) == k, name, ": h_selected must be 1D [k]");
+    const int64_t num_groups = scale_selected.size(1);
+
+    auto y = torch::empty({H}, h_selected.options());
+    launch_gemv_w4a16_sparse_accumulate(Wq_selected.data_ptr<uint8_t>(), scale_selected.data_ptr<float>(),
+                                         half_ptr(h_selected), half_ptr(y), static_cast<int>(H), static_cast<int>(k),
+                                         static_cast<int>(group_size), static_cast<int>(num_groups));
+    return y;
+}
+
 torch::Tensor swiglu_gate_up(torch::Tensor gate_W, torch::Tensor up_W, torch::Tensor x) {
     check_f16_cuda_contiguous(gate_W, "swiglu_gate_up(gate_W)");
     check_f16_cuda_contiguous(up_W, "swiglu_gate_up(up_W)");
@@ -437,6 +465,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "W4A16 grouped GEMV: AWQ-packed INT4 weights, scalar dequant, register-cached group scale (M4)");
     m.def("gemv_w4a16_group_lop3", &gemv_w4a16_group_lop3,
           "W4A16 grouped GEMV: same as gemv_w4a16_group but with bit-pattern-construction INT4->FP16 dequant (M4)");
+    m.def("gemv_w4a16_sparse_accumulate", &gemv_w4a16_sparse_accumulate,
+          "Sparse 'down' GEMV: y[H] = sum_i h[i] * W_T[i,:] over k selected (already row-gathered) rows of a "
+          "transposed-stored down_proj (M7)");
     m.def("swiglu_gate_up", &swiglu_gate_up,
           "Fused SwiGLU gate+up: h = silu(gate_W @ x) * (up_W @ x), one pass over x for both projections (M5)");
     m.def("kv_cache_append", &kv_cache_append,

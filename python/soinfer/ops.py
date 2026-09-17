@@ -176,6 +176,18 @@ def gather_rows_naive(matrix: torch.Tensor, indices: torch.Tensor, gpu_dst: torc
     _C.gather_rows_naive(matrix, indices, gpu_dst)
 
 
+def gemv_w4a16_sparse_accumulate(Wq_selected: torch.Tensor, scale_selected: torch.Tensor,
+                                  h_selected: torch.Tensor, H: int, group_size: int) -> torch.Tensor:
+    """M7 task 3, 'down' direction: y[H] = sum_i h_selected[i] * W_T[i, :], over the k selected
+    (already row-gathered via gather_rows_*) rows of down_proj stored TRANSPOSED
+    ([intermediate_size, hidden_size] instead of nn.Linear's usual [hidden_size,
+    intermediate_size]) so channel selection is a row gather here too, same as up_proj. The
+    'up' direction needs no new kernel: it's gemv_w4a16_group_lop3 applied directly to
+    up_proj's k gathered rows (N=k instead of N=intermediate_size), since up_proj is already
+    row-indexed by intermediate channel."""
+    return _C.gemv_w4a16_sparse_accumulate(Wq_selected, scale_selected, h_selected, H, group_size)
+
+
 def precompute_rope_cos_sin(head_dim: int, theta: float, pos: int, device, dtype=torch.float32):
     """cos/sin for RoPE at absolute position `pos`, matching HF's Qwen3RotaryEmbedding exactly:
     inv_freq[i] = 1/theta^(2i/head_dim) for i in [0, head_dim/2), angle_i = pos*inv_freq[i]. M5."""
