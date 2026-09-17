@@ -697,3 +697,55 @@ stretch task) are both un-started but explicitly optional per spec. The
 real next milestone is M6 (offload: streaming weights over PCIe), which
 is where this project's actual thesis (DIP, PCIe-bound offload) begins --
 M5 was prerequisite plumbing, not the point.
+
+### Back to M4: Nsight Compute finally answers what's actually limiting W4A16 GEMV
+
+2026-09-16, later same session. `ncu` (Nsight Compute's CLI) is installed
+and *works* on this Colab T4 -- no permission wall (a real risk with cloud
+GPUs; worth having checked before promising anything). Profiled
+`gemv_w4a16_group_lop3_kernel` at the canonical benchmark shape (K=N=4096)
+with `ncu --set full`. The verdict, straight from the tool: **"Compute is
+more heavily utilized than Memory"** -- Compute (SM) Throughput 68.9% vs.
+Memory Throughput 51.9% of their respective peaks. This kernel is
+ALU-bound, not memory-bound, which is the opposite of what "GEMV is
+memory-bound" (true for FP16 GEMV, PROJECT_SPEC.md sec 3's own framing)
+would suggest -- the INT4 dequant/decode work per element is expensive
+enough to flip that. Supporting detail: ALU is the single highest-utilized
+pipeline (55.3% of active cycles); achieved occupancy is a healthy 87.5%
+(not an occupancy problem); registers/thread is 38 (no spilling); global
+loads are already ~97% coalesced-efficient (30.9/32 bytes per sector
+utilized) -- so the earlier coalescing fix from this session's first M4
+pass was correct and isn't leaving anything on the table. The bottleneck
+is real per-element instruction count, not access pattern or occupancy.
+
+**Tried the obvious ALU-reduction lever -- it broke correctness, reverted
+immediately.** The LOP3 dequant path's inner loop does 2 `__half22float2`
+conversions + 2 float multiplies + 1 float add per half2 pair (8 ops for
+2 elements). Native `__hmul2` can do the multiply as ONE half2 instruction,
+converting only the *product* to float2 (1 conversion instead of 2) before
+summing -- cuts the op count meaningfully. Patched it, rebuilt, ran the
+existing test suite before ever benchmarking: `test_w4a16_naive_and_lop3_agree`
+and both `test_w4a16_gemv_matches_reference[...]` cases (full K=4096/4099
+dot products) failed the 1e-2/5e-3 tolerance, while the exact-dequant
+basis-vector tests (single nonzero term) still passed. Diagnosis: rounding
+each product to fp16 *before* summing, instead of multiplying in fp32,
+compounds across ~4096 terms into materially larger total error than
+before -- exactly the failure mode this project's fp32-accumulation
+convention (common.cuh, every GEMV kernel so far) exists to prevent.
+Reverted via `git checkout --` before ever measuring whether it was even
+faster, because correctness comes first regardless of the payoff --
+PROJECT_SPEC.md's own framing: "the single most common way this project
+fails is writing a fast kernel that produces wrong numbers."
+
+**Where this leaves M4's 3x gap:** now backed by real profiling data
+instead of a guess, but not closed. The path forward would need to reduce
+ALU work *without* sacrificing fp32-accumulated products -- e.g.
+restructuring which operations happen in half2 vs. float (the dequant
+bit-manipulation itself is integer ops, already cheap; the expensive part
+is the float conversions and accumulation, which need to stay fp32-safe),
+or a different algorithmic approach entirely (e.g. more elements decoded
+per instruction via wider LOP3 batching, though the earlier `uint4`
+per-lane-read experiment already showed that widening naively trades away
+coalescing). This needs more iteration than fits in one sitting; recorded
+here as a validated, data-backed open problem rather than a guess to try
+next time.
