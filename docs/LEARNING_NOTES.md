@@ -943,3 +943,49 @@ follow-up, not a same-session fix. M6 is otherwise complete: roofline
 (8.69x transfer-bound), the real headline model (coherent generation,
 verified), and now the overlap efficiency number the acceptance criteria
 ask for.
+
+### 2026-09-17 -- M7 task 1: top-k threshold-select kernel
+
+**Correctness first, and it's solid.** `topk_threshold_select` finds the
+top-k by *value* magnitude via bisection on a threshold tau rather than
+sorting: maintain `[lo, hi]` bounding the correct tau, and on each
+iteration every thread in a single block counts how many elements are
+`>= mid` via a block-wide reduction (`block_reduce_sum`, reusing the same
+shared-memory reduction primitive as `block_reduce_max`), then narrows
+the range. 24 iterations is enough halvings for fp32 precision on
+realistic activation magnitudes. A final compaction pass walks the array
+once more, atomically claiming output slots for everything `>= tau`. All
+8 tests in `tests/test_m7_kernels.py` pass on the T4, including an exact
+set-equality check against `torch.topk` at Qwen3-14B's real
+`intermediate_size` (17408) and a heavy-tie stress test (10 distinct
+values repeated across 8192 elements) -- ties don't break it because the
+compaction pass doesn't care about relative order among values `>= tau`,
+only membership.
+
+**The performance target is a genuine miss, and the reason is
+structural, not a bug.** The spec's bar is single-digit microseconds at
+I=17408, k=0.5*I. First measurement (`kThreads=256`): 639us -- about
+100x over target. Root cause: the kernel launches a single thread block
+(`<<<1, kThreads>>>`), so it only ever occupies one SM out of the T4's
+40. Every one of the 24 bisection iterations does a full O(n) pass over
+the array PLUS a `__syncthreads()`-gated block reduction, all serialized
+on that one SM, while the other 39 sit idle. Bumping `kThreads` 256 ->
+1024 (Turing's per-block max) gave a real 3.5x speedup -- 639us -> 180.9us
+median at the I=17408/k=0.5*I point (`reports/m7_topk_timing.csv`,
+`make bench-m7`) -- because more resident warps on that one SM hide more
+memory latency during the linear scans. But it's still ~18x over the
+single-digit-us target: more threads per block raises occupancy on ONE
+SM, it doesn't recruit the other 39. That's a ceiling this design
+structurally can't cross.
+
+Recorded honestly rather than declared "good enough": task 1's spec
+explicitly frames the multi-block/radix-select variants as the
+follow-up once correctness is nailed down, and this single-block version
+is deliberately the correctness-first baseline, not the final answer.
+Two credible next steps, neither attempted yet: (1) a multi-block
+version using cooperative groups' grid-wide sync (so all 40 SMs
+participate in every bisection iteration's count, then one final
+cross-block reduction), or (2) a proper radix-select (bucket by
+exponent/mantissa bits, no per-iteration full-array rescan needed) --
+the more standard GPU top-k approach and likely the bigger win, since it
+avoids the 24x redundant full-array scan this bisection design pays for.

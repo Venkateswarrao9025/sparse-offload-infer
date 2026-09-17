@@ -3,7 +3,7 @@
 #include "reduce.cuh"
 
 namespace {
-constexpr int kThreads = 256;
+constexpr int kThreads = 1024;  // max threads/block on Turing -- more parallelism within the single block
 constexpr int kBisectionIters = 24;  // fp32 precision: range halves 24x, plenty for realistic activation magnitudes
 }  // namespace
 
