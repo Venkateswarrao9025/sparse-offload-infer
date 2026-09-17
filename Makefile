@@ -1,4 +1,4 @@
-.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline bench-m7 profile profile-m6-overlap clean
+.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline bench-m7 bench-m7-gather profile profile-m6-overlap clean
 
 # --no-build-isolation: link against the torch already installed in this
 # environment (e.g. Colab's preinstalled torch+cu121) instead of pip building
@@ -9,7 +9,7 @@ build:
 test:
 	pytest tests/ -v
 
-bench: bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m7
+bench: bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m7 bench-m7-gather
 
 bench-pcie:
 	python bench/bench_pcie.py
@@ -31,6 +31,9 @@ bench-m6:
 
 bench-m7:
 	python bench/bench_m7_topk.py
+
+bench-m7-gather:
+	python bench/bench_m7_gather.py
 
 # Not part of `make bench` -- downloads a 14B model (~28GB) and takes
 # several minutes. Run explicitly: `make bench-m6-headline`.

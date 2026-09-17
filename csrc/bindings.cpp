@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 
 #include <cmath>
@@ -6,6 +7,7 @@
 
 #include "kernels/decode_attention.cuh"
 #include "kernels/elementwise.cuh"
+#include "kernels/gather_rows.cuh"
 #include "kernels/gemv_fp16.cuh"
 #include "kernels/gemv_w4a16_group.cuh"
 #include "kernels/gemv_w8a16.cuh"
@@ -371,6 +373,47 @@ std::tuple<torch::Tensor, torch::Tensor> topk_threshold_select(torch::Tensor abs
     return {out_indices, out_count};
 }
 
+namespace {
+
+void check_gather_rows_common(const torch::Tensor& matrix, const torch::Tensor& indices,
+                               const torch::Tensor& gpu_dst, const char* name) {
+    TORCH_CHECK(matrix.is_cpu() && matrix.is_pinned(), name, "(matrix): must be pinned host memory");
+    TORCH_CHECK(matrix.scalar_type() == torch::kUInt8 && matrix.dim() == 2 && matrix.is_contiguous(),
+                name, "(matrix): must be a contiguous 2D uint8 tensor [num_rows, row_nbytes]");
+    TORCH_CHECK(indices.is_cpu() && indices.scalar_type() == torch::kInt64 && indices.dim() == 1,
+                name, "(indices): must be a 1D int64 CPU tensor");
+    TORCH_CHECK(gpu_dst.is_cuda() && gpu_dst.scalar_type() == torch::kUInt8 && gpu_dst.is_contiguous(),
+                name, "(gpu_dst): must be a contiguous CUDA uint8 tensor");
+    const int64_t k = indices.size(0);
+    const int64_t row_nbytes = matrix.size(1);
+    TORCH_CHECK(gpu_dst.numel() >= k * row_nbytes, name, "(gpu_dst): too small for k * row_nbytes bytes");
+}
+
+}  // namespace
+
+void gather_rows_staged(torch::Tensor matrix, torch::Tensor indices, torch::Tensor staging, torch::Tensor gpu_dst) {
+    check_gather_rows_common(matrix, indices, gpu_dst, "gather_rows_staged");
+    TORCH_CHECK(staging.is_cpu() && staging.is_pinned() && staging.scalar_type() == torch::kUInt8,
+                "gather_rows_staged(staging): must be pinned host uint8 memory");
+    const int64_t k = indices.size(0);
+    const int64_t row_nbytes = matrix.size(1);
+    TORCH_CHECK(staging.numel() >= k * row_nbytes, "gather_rows_staged(staging): too small for k * row_nbytes bytes");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_gather_rows_staged(matrix.data_ptr<uint8_t>(), indices.data_ptr<int64_t>(), k, row_nbytes,
+                               staging.data_ptr<uint8_t>(), gpu_dst.data_ptr<uint8_t>(), stream.stream());
+}
+
+void gather_rows_naive(torch::Tensor matrix, torch::Tensor indices, torch::Tensor gpu_dst) {
+    check_gather_rows_common(matrix, indices, gpu_dst, "gather_rows_naive");
+    const int64_t k = indices.size(0);
+    const int64_t row_nbytes = matrix.size(1);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_gather_rows_naive(matrix.data_ptr<uint8_t>(), indices.data_ptr<int64_t>(), k, row_nbytes,
+                              gpu_dst.data_ptr<uint8_t>(), stream.stream());
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("add_one", &add_one, "Add 1.0 to every element of a float32 CUDA tensor (M0 toolchain smoke test)");
     m.def("vector_add", &vector_add, "out = a + b, elementwise (M1)");
@@ -404,4 +447,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Applies RoPE (rotate-half convention, matching HF exactly) to x [num_heads, head_dim] in place (M5)");
     m.def("topk_threshold_select", &topk_threshold_select,
           "Selects the k largest-magnitude indices via single-launch binary-search threshold + compact (M7)");
+    m.def("gather_rows_staged", &gather_rows_staged,
+          "Row gather v1: host memcpy into a contiguous pinned staging buffer, then one H2D cudaMemcpyAsync (M7)");
+    m.def("gather_rows_naive", &gather_rows_naive,
+          "Row gather baseline: one cudaMemcpyAsync per selected row, straight from the pinned arena (M7)");
 }

@@ -158,6 +158,24 @@ def topk_threshold_select(abs_g: torch.Tensor, k: int) -> torch.Tensor:
     return indices
 
 
+def gather_rows_staged(matrix: torch.Tensor, indices: torch.Tensor, staging: torch.Tensor,
+                        gpu_dst: torch.Tensor) -> None:
+    """M7 task 2, coalesced variant: memcpy each selected row of `matrix` (pinned CPU uint8,
+    [num_rows, row_nbytes], e.g. PinnedWeightStore.matrix_view(handle)) into `staging` (pinned
+    CPU uint8, >= k*row_nbytes), then a single H2D cudaMemcpyAsync of the whole staged block into
+    `gpu_dst` (CUDA uint8, >= k*row_nbytes). Async on the current stream -- caller must
+    synchronize before reading gpu_dst. indices: 1D int64 CPU tensor."""
+    _C.gather_rows_staged(matrix, indices, staging, gpu_dst)
+
+
+def gather_rows_naive(matrix: torch.Tensor, indices: torch.Tensor, gpu_dst: torch.Tensor) -> None:
+    """M7 task 2, naive baseline: one cudaMemcpyAsync per selected row, straight from its
+    (scattered) offset in `matrix` (pinned CPU uint8) to its slot in `gpu_dst` (CUDA uint8).
+    Same arguments and async-on-current-stream semantics as gather_rows_staged, minus the
+    staging buffer -- exists to benchmark against it (see PROJECT_SPEC.md M7 task 2)."""
+    _C.gather_rows_naive(matrix, indices, gpu_dst)
+
+
 def precompute_rope_cos_sin(head_dim: int, theta: float, pos: int, device, dtype=torch.float32):
     """cos/sin for RoPE at absolute position `pos`, matching HF's Qwen3RotaryEmbedding exactly:
     inv_freq[i] = 1/theta^(2i/head_dim) for i in [0, head_dim/2), angle_i = pos*inv_freq[i]. M5."""
