@@ -660,3 +660,40 @@ sufficient for it (error could still compound across layers/steps in a way
 a single-layer test can't see). Also open: INT8 tensor-core GEMM (M4's
 optional stretch task), and the paged KV-cache layout (M5 task 3's stretch
 goal, currently contiguous-only).
+
+**M5 done: end-to-end greedy decode matches HF token-for-token.** Built a
+full (random-weight, Qwen3-1.7B-shaped, 4-layer) `Qwen3ForCausalLM`, took
+HF's `model.generate(do_sample=False)` token sequence as ground truth, and
+ran an independent greedy-decode loop built entirely from `soinfer.ops`
+kernels -- the same per-layer assembly as `test_layer_parity.py`, looped
+across all decoder layers and every generated position, with each layer
+keeping its own growing KV cache across steps (embedding lookup and
+argmax are the only two ops left as plain tensor indexing -- everything
+from the first decoder layer onward, including the final norm and the
+`lm_head` GEMV, is a `soinfer.ops` kernel call). Tried 6 different
+(seed, prompt, layer-count) combinations interactively before writing the
+test file: **exact token-for-token match, every time, no divergence.**
+Wrote up 3 of those as `tests/test_end_to_end.py`, PROJECT_SPEC.md M5's
+own words: "greedy decode... produces the identical token sequence as the
+HF reference... this test is the backbone of the project." All pass on
+the real T4; full suite is 104/104.
+
+This closes M5's two named acceptance tests (`test_layer_parity.py` and
+`test_end_to_end.py`) for the first time in this project, on the same
+day the milestone's kernels were written -- worth noting because M4 took
+several benchmark-and-fix iterations to reach its (still not fully met)
+bar, while M5's correctness work went from "nothing written" to
+"token-for-token match against real HF" in one session with zero
+correctness bugs along the way, once RoPE/QK-norm were read from the
+actual source instead of guessed. The difference: M4's remaining gap is a
+*performance* problem (needs profiling tools this project doesn't have
+easy access to yet); M5's tasks were *correctness* problems, and reading
+the real reference implementation directly, rather than working from a
+remembered convention, seems to have been what made the difference.
+
+**Remaining for M5/M6:** the paged KV-cache layout (M5 task 3's stretch
+goal, currently contiguous-only) and INT8 tensor-core GEMM (M4's optional
+stretch task) are both un-started but explicitly optional per spec. The
+real next milestone is M6 (offload: streaming weights over PCIe), which
+is where this project's actual thesis (DIP, PCIe-bound offload) begins --
+M5 was prerequisite plumbing, not the point.
