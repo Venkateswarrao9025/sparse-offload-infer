@@ -1192,3 +1192,66 @@ to catch, AND shows that hardware verification at ONE scale doesn't
 generalize to correctness at another. The lesson generalizes past this
 one race: any claim of "verified" from here on should say verified on
 WHAT, at WHAT scale, under WHAT load -- not just verified.
+
+### 2026-09-17 -- M7 task 4: the k-sweep Pareto curve, and where the knee actually is
+
+With the race fixed, `bench/bench_m7_pareto.py` on real Qwen3-1.7B gives a
+sensible result on the first re-run (`reports/m7_pareto.csv`, teacher-forced
+perplexity over a 70-token real passage, dense's own already-verified
+streaming path as the reference):
+
+| k/I | bytes/token saved | tokens/sec | perplexity | ratio vs dense |
+|---|---|---|---|---|
+| 1.0 (dense) | 0% | 12.06 | 16.50 | 1.00x |
+| 1.0 (DIP) | 0% | 5.11 | 16.91 | 1.02x |
+| 0.75 | 12.5% | 6.78 | 60.32 | 3.65x |
+| 0.5 | 25.0% | 7.59 | 251.77 | 15.26x |
+| 0.375 | 31.2% | 8.88 | 526.76 | 31.92x |
+| 0.25 | 37.5% | 10.61 | 259446 | 15721x |
+| 0.125 | 43.8% | 9.72 | 1117671 | 67723x |
+
+Two things stand out, both sensible in hindsight but neither obvious in
+advance:
+
+**DIP at k=I (no pruning at all) is SLOWER than dense (5.11 vs 12.06
+tok/s), despite moving identical bytes.** The extra cost is entirely
+mechanism overhead the dense path doesn't pay: `topk_threshold_select`,
+the `.cpu()` device-to-host sync `gather_rows_staged` needs (indices must
+be host-resident for its host-side memcpy), and a full
+`torch.cuda.synchronize()` per layer per token before the sparse GEMVs can
+read the gathered buffers (`run_decoder_layer_dip`'s docstring already
+flagged this synchronous, non-overlapped design as an honest limitation,
+not an oversight). This is the SAME shape of finding as M6's CPU-dispatch
+bottleneck: the mechanism has fixed per-call overhead that has to be
+amortized by the bytes it saves, and at k=I there's nothing to amortize it
+against.
+
+**The knee is sharp, not gradual, and it's between k/I=0.375 and
+k/I=0.25.** Perplexity degrades smoothly and tolerably down to k/I=0.375
+(ratio 31.9x -- bad, but the output is presumably still recognizably
+related to the passage), then EXPLODES by nearly three more orders of
+magnitude at k/I=0.25 (ratio 15721x) and stays catastrophic at 0.125. This
+is not a smooth accuracy-latency tradeoff curve with a rounded elbow --
+it's closer to a cliff. Picking the knee: **k/I ≈ 0.375-0.5** is the
+defensible operating point -- 0.5 keeps perplexity ratio to 15x (bad but
+recoverable-looking) while saving 25% of bytes/token; anything below 0.375
+is off a cliff this model/passage/k-selection-criterion combination can't
+absorb. The honest caveat: this is ONE model (1.7B, small), ONE 70-token
+passage, and top-k-by-raw-gate-magnitude is the simplest possible
+selection criterion -- PROJECT_SPEC.md's own framing (M8's calibration
+pass, hot-channel frequency) suggests real deployments would want
+per-channel calibration data informing which channels are safe to prune,
+not a fresh per-token magnitude cutoff with no memory of what mattered on
+other tokens. The cliff observed here is plausibly THIS criterion's
+weakness specifically (a single passage's channel-importance ranking
+changing sharply once enough "usually-safe" channels get cut), not
+necessarily inherent to DIP as an approach -- exactly what M8's
+frequency-aware hot cache is positioned to investigate next.
+
+M7's stated acceptance ("measurable reduction in bytes transferred per
+token, instrumented directly... with perplexity degradation quantified
+rather than hand-waved") is met: bytes/token are computed directly from
+the arena's own bookkeeping (`dip_bytes_per_token`, not inferred from
+timing), and perplexity is a real, quantified number at every point,
+including the honest finding that it's not a smooth curve. M7 is
+functionally complete (tasks 1-4 all done and verified); M8 is next.
