@@ -30,18 +30,22 @@ def _load_small_to_gpu(model_dir: str, weight_map: dict[str, str], name: str, dt
     return g
 
 
-def load_streaming_model(model_dir: str, group_size: int = 128) -> StreamingModel:
+def load_streaming_model(model_dir: str, group_size: int = 128, include_dip: bool = False) -> StreamingModel:
     """Reads config.json for architecture dims, streams every decoder
     layer's linear weights into a pinned, INT4-quantized arena, and loads
     embeddings/LM head/norms directly to GPU as FP16. Prints progress
     every few layers -- for a 14B-class model this takes minutes, not
-    seconds, and silent multi-minute calls are a bad experience."""
+    seconds, and silent multi-minute calls are a bad experience.
+
+    include_dip (M7): also registers each layer's down_proj_T (see
+    load_hf_checkpoint.stream_load_layers), needed by generate.py's
+    run_decoder_layer_dip."""
     with open(os.path.join(model_dir, "config.json")) as f:
         config = json.load(f)
     num_layers = config["num_hidden_layers"]
 
     print(f"streaming {num_layers} decoder layers into a pinned INT4 arena...")
-    store, matrices = stream_load_layers(model_dir, num_layers, group_size=group_size)
+    store, matrices = stream_load_layers(model_dir, num_layers, group_size=group_size, include_down_proj_t=include_dip)
 
     with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
         weight_map = json.load(f)["weight_map"]

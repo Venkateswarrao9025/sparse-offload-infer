@@ -1,4 +1,4 @@
-.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline bench-m7 bench-m7-gather profile profile-m6-overlap clean
+.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline bench-m7 bench-m7-gather bench-m7-pareto profile profile-m6-overlap clean
 
 # --no-build-isolation: link against the torch already installed in this
 # environment (e.g. Colab's preinstalled torch+cu121) instead of pip building
@@ -39,6 +39,12 @@ bench-m7-gather:
 # several minutes. Run explicitly: `make bench-m6-headline`.
 bench-m6-headline:
 	python bench/bench_m6_headline_model.py
+
+# Not part of `make bench` -- downloads Qwen3-1.7B (~3.4GB) if not already
+# cached and runs a 6-point k-sweep with real generation + perplexity at
+# each point. Run explicitly: `make bench-m7-pareto`.
+bench-m7-pareto:
+	python bench/bench_m7_pareto.py
 
 profile:
 	nsys profile -o reports/profile python bench/bench_pcie.py
