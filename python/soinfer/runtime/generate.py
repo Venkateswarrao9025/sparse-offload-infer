@@ -2,18 +2,23 @@
 layer weights are streamed from a PinnedWeightStore just-in-time, one
 matrix at a time, instead of sitting resident on the GPU.
 
-This is deliberately the "correctness first" version (PROJECT_SPEC.md's
-own framing, echoed throughout this project's M2/M4/M5 progression):
-`StreamManager` is used with a single buffer per weight role (prefetch
-immediately followed by wait, no cross-layer overlap yet) and Q/K/V are
-three separate GEMVs rather than M5's fused_qkv_projection. Both are real,
-measured follow-ups (the M6 roofline already shows the overlap
-*opportunity*; realizing it in this actual loop, and re-fusing QKV against
-per-tensor-quantized weights, are the natural next optimization passes),
-not correctness gaps.
+`WeightPipeline` double-buffers this: while the default (compute) stream
+is running the GEMV for weight i, a second CUDA stream is already copying
+weight i+1 into the other buffer, continuously across the ENTIRE
+generation (not reset per layer or per token -- the sequence of weight
+identities is static and known in advance regardless of which tokens end
+up being generated, so there's nothing to gain from ever letting the
+pipeline drain). This is PROJECT_SPEC.md M6 task 2's "prefetch layer i+1
+while computing layer i," generalized to weight-level granularity.
+
+Q/K/V are still three separate GEMVs rather than M5's fused
+`fused_qkv_projection` -- re-fusing them against per-tensor-quantized
+weights (each needs its own scale) is a separate follow-up, not required
+for the overlap this file adds.
 """
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import torch
@@ -28,10 +33,10 @@ GROUP_SIZE = 128
 
 @dataclass
 class StreamingModel:
-    """Everything generate_streaming needs, bundled: the pinned arena and
-    its per-matrix handles (from load_hf_checkpoint.stream_load_layers),
-    the small always-resident GPU tensors (embeddings/lm_head/norms, none
-    of which benefit from per-layer streaming -- see load_hf_checkpoint.py's
+    """Everything the decode loop needs, bundled: the pinned arena and its
+    per-matrix handles (from load_hf_checkpoint.stream_load_layers), the
+    small always-resident GPU tensors (embeddings/lm_head/norms, none of
+    which benefit from per-layer streaming -- see load_hf_checkpoint.py's
     module docstring for why), and the streaming machinery itself."""
 
     store: PinnedWeightStore
@@ -49,30 +54,67 @@ class StreamingModel:
     rope_theta: float
 
     def __post_init__(self) -> None:
-        self.stream_manager = StreamManager(num_buffers=1)
-        self.gpu_bufs: dict[str, torch.Tensor] = {}
-        for suffix in LINEAR_SUFFIXES:
-            m = self.matrices[f"model.layers.0.{suffix}"]
-            self.gpu_bufs[suffix] = torch.empty(m.n, m.handle.row_nbytes, dtype=torch.uint8, device="cuda")
+        self.stream_manager = StreamManager(num_buffers=2)
 
 
-def _load_and_gemv(model: StreamingModel, layer_idx: int, suffix: str, x_in: torch.Tensor) -> torch.Tensor:
-    m = model.matrices[f"model.layers.{layer_idx}.{suffix}"]
-    buf = model.gpu_bufs[suffix]
-    model.stream_manager.prefetch(0, buf, model.store.matrix_view(m.handle))
-    model.stream_manager.wait(0)
-    return ops.gemv_w4a16_group_lop3(buf, m.scale, x_in, m.packed_k, GROUP_SIZE)
+class WeightPipeline:
+    """Walks the flat, cyclic sequence of per-token weight names
+    (layer0.q, layer0.k, ..., layer0.down, layer1.q, ..., wrapping back to
+    layer0.q for the next token) one step ahead of compute. Two generic
+    byte buffers, each sized to the single largest weight in the model --
+    reused across every role/layer rather than one pair per role, since
+    only one weight is ever "in flight" at a time regardless of its shape.
+    """
+
+    def __init__(self, model: StreamingModel):
+        self.model = model
+        self.sm = model.stream_manager
+        max_bytes = max(m.n * m.handle.row_nbytes for m in model.matrices.values())
+        self.bufs = [torch.empty(max_bytes, dtype=torch.uint8, device="cuda") for _ in range(2)]
+        per_token_sequence = [
+            f"model.layers.{i}.{suffix}" for i in range(model.num_layers) for suffix in LINEAR_SUFFIXES
+        ]
+        self._names = itertools.cycle(per_token_sequence)
+        self.cur_buf = 0
+        self.cur_name = next(self._names)
+        self._prefetch_into(self.cur_buf, self.cur_name)  # prime: get the first weight in flight
+
+    def _prefetch_into(self, buf_idx: int, name: str) -> None:
+        m = self.model.matrices[name]
+        nbytes = m.n * m.handle.row_nbytes
+        view = self.bufs[buf_idx][:nbytes].view(m.n, m.handle.row_nbytes)
+        self.sm.prefetch(buf_idx, view, self.model.store.matrix_view(m.handle))
+
+    def next_gemv(self, x_in: torch.Tensor) -> torch.Tensor:
+        """Waits for the currently-in-flight weight (issued either by
+        __init__ or the previous call), runs its GEMV, and immediately
+        kicks off the NEXT weight's prefetch into the other buffer before
+        returning -- so that transfer runs concurrently with whatever
+        compute the caller does with this call's result."""
+        name = self.cur_name
+        m = self.model.matrices[name]
+        self.sm.wait(self.cur_buf)
+        nbytes = m.n * m.handle.row_nbytes
+        view = self.bufs[self.cur_buf][:nbytes].view(m.n, m.handle.row_nbytes)
+        result = ops.gemv_w4a16_group_lop3(view, m.scale, x_in, m.packed_k, GROUP_SIZE)
+
+        next_buf = 1 - self.cur_buf
+        next_name = next(self._names)
+        self._prefetch_into(next_buf, next_name)
+        self.cur_buf, self.cur_name = next_buf, next_name
+        return result
 
 
 def run_decoder_layer_streaming(
-    model: StreamingModel, layer_idx: int, x_flat: torch.Tensor, pos: int, k_cache: torch.Tensor, v_cache: torch.Tensor
+    pipeline: WeightPipeline, model: StreamingModel, layer_idx: int, x_flat: torch.Tensor, pos: int,
+    k_cache: torch.Tensor, v_cache: torch.Tensor,
 ) -> torch.Tensor:
     """One decoder layer's forward for a single token at position `pos`,
-    streaming its 7 linear weights from the pinned arena just-in-time.
-    Mutates k_cache/v_cache in place (append at `pos`). Same block
-    structure as tests/test_layer_parity.py and test_end_to_end.py's
-    _run_one_layer, but with quantized-streamed weights instead of
-    resident FP16 ones."""
+    pulling its 7 linear weights from `pipeline` (already in flight,
+    overlapped with the previous weight's compute). Mutates k_cache/
+    v_cache in place (append at `pos`). Same block structure as
+    tests/test_layer_parity.py and test_end_to_end.py's _run_one_layer,
+    but with quantized-streamed weights instead of resident FP16 ones."""
     NQ, NKV, HD = model.num_attention_heads, model.num_key_value_heads, model.head_dim
     eps, theta = model.rms_norm_eps, model.rope_theta
     norms = model.layer_norms[layer_idx]
@@ -80,9 +122,9 @@ def run_decoder_layer_streaming(
     residual = x_flat
     h = ops.rmsnorm(x_flat.unsqueeze(0), norms["input_layernorm"], eps).squeeze(0).contiguous()
 
-    q = _load_and_gemv(model, layer_idx, "self_attn.q_proj.weight", h).view(NQ, HD).contiguous()
-    k = _load_and_gemv(model, layer_idx, "self_attn.k_proj.weight", h).view(NKV, HD).contiguous()
-    v = _load_and_gemv(model, layer_idx, "self_attn.v_proj.weight", h).view(NKV, HD).contiguous()
+    q = pipeline.next_gemv(h).view(NQ, HD).contiguous()
+    k = pipeline.next_gemv(h).view(NKV, HD).contiguous()
+    v = pipeline.next_gemv(h).view(NKV, HD).contiguous()
 
     q = ops.qk_norm(q, norms["q_norm"], eps)
     k = ops.qk_norm(k, norms["k_norm"], eps)
@@ -93,16 +135,16 @@ def run_decoder_layer_streaming(
     ops.kv_cache_append(k_cache, v_cache, k, v, pos)
     attn_out = ops.decode_attention(q, k_cache, v_cache, pos + 1).reshape(NQ * HD).contiguous()
 
-    o = _load_and_gemv(model, layer_idx, "self_attn.o_proj.weight", attn_out)
+    o = pipeline.next_gemv(attn_out)
     h2 = residual + o
 
     residual2 = h2
     h3 = ops.rmsnorm(h2.unsqueeze(0), norms["post_attention_layernorm"], eps).squeeze(0).contiguous()
 
-    gate = _load_and_gemv(model, layer_idx, "mlp.gate_proj.weight", h3)
-    up = _load_and_gemv(model, layer_idx, "mlp.up_proj.weight", h3)
+    gate = pipeline.next_gemv(h3)
+    up = pipeline.next_gemv(h3)
     mlp_h = (torch.nn.functional.silu(gate.float()) * up.float()).half()
-    down = _load_and_gemv(model, layer_idx, "mlp.down_proj.weight", mlp_h)
+    down = pipeline.next_gemv(mlp_h)
 
     return residual2 + down
 
@@ -112,17 +154,21 @@ def generate_streaming(model: StreamingModel, prompt_ids: list[int], n_new: int,
     project targets decode, not batched prefill -- see PROJECT_SPEC.md sec
     2 -- so the prompt is just decode steps with no output taken until
     it's consumed), then generates up to `n_new` more tokens, stopping
-    early on `eos_token_id` if given."""
+    early on `eos_token_id` if given. One WeightPipeline runs continuously
+    across the whole call -- prompt tokens and generated tokens alike --
+    since the weight-load sequence never depends on which tokens are
+    actually produced."""
     NKV, HD = model.num_key_value_heads, model.head_dim
     k_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
     v_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
+    pipeline = WeightPipeline(model)
 
     all_tokens = list(prompt_ids)
     x = None
     for pos, tok in enumerate(prompt_ids):
         x = model.embed_tokens[tok].contiguous()
         for layer_idx in range(model.num_layers):
-            x = run_decoder_layer_streaming(model, layer_idx, x, pos, k_caches[layer_idx], v_caches[layer_idx])
+            x = run_decoder_layer_streaming(pipeline, model, layer_idx, x, pos, k_caches[layer_idx], v_caches[layer_idx])
 
     pos = len(prompt_ids)
     for _ in range(n_new):
@@ -134,7 +180,7 @@ def generate_streaming(model: StreamingModel, prompt_ids: list[int], n_new: int,
             break
         x = model.embed_tokens[next_tok].contiguous()
         for layer_idx in range(model.num_layers):
-            x = run_decoder_layer_streaming(model, layer_idx, x, pos, k_caches[layer_idx], v_caches[layer_idx])
+            x = run_decoder_layer_streaming(pipeline, model, layer_idx, x, pos, k_caches[layer_idx], v_caches[layer_idx])
         pos += 1
 
     return all_tokens
