@@ -1,0 +1,12 @@
+{
+  "copy_busy_ms": 81.028187,
+  "compute_busy_ms": 10.502257,
+  "overlap_achieved_ms": 9.758918,
+  "overlap_ideal_ms": 10.502257,
+  "overlap_efficiency_pct": 92.9221023633301,
+  "wall_clock_ms": 166.843296,
+  "gpu_idle_ms": 85.07177,
+  "gpu_idle_pct": 50.98902505498333,
+  "num_copy_events": 42,
+  "num_compute_events": 186
+}

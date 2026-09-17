@@ -864,3 +864,79 @@ Q/K/V, three separate GEMVs instead of M5's fused one). The M6 roofline
 already measured the overlap opportunity (8.69x); wiring `StreamManager`
 to actually prefetch layer i+1 while layer i computes, in this real loop,
 is the natural next pass, not a fix for a correctness problem.
+
+### M6 close-out: real double buffering, and what Nsight Systems actually showed
+
+**Wired the overlap in for real.** `WeightPipeline` (new, in
+`runtime/generate.py`) continuously prefetches one weight ahead across the
+*entire* generation -- not reset per layer or per token, since the
+weight-load sequence is completely static regardless of which tokens end
+up generated, so there's nothing to gain from ever letting it drain. Two
+generic byte buffers sized to the single largest weight, cycling through
+the 7-per-layer role sequence via `itertools.cycle`.
+
+**First result: no measurable speedup (14.51ms vs 14.60ms/layer) --
+and initially I nearly mis-attributed this to a stale-module caching bug**
+(this Colab kernel had been alive since before the pipelining commit, and
+a plain `import` doesn't reload an already-cached module even after
+`git pull` changes the file on disk -- `importlib.reload`/clearing
+`sys.modules` was needed to actually test the new code). After forcing a
+clean reload and re-confirming the timing was still flat, that ruled out
+staleness as the explanation, which meant the "no speedup" result was
+real and needed an actual explanation, not a retry.
+
+**Nsight Systems settled it, and the answer wasn't what a quick guess
+would predict.** `nsys` isn't on PATH on Colab but is installed (ships
+with Nsight Compute, under `/opt/nvidia/nsight-compute/<version>/host/
+target-linux-x64/nsys`) -- profiled `bench/profile_m6_overlap.py` (a small
+synthetic Qwen3-14B-shaped model, isolating the pipelining *mechanism*
+from any specific checkpoint) with `--capture-range=cudaProfilerApi`
+bracketing the loop, then parsed the `cuda_gpu_trace` CSV export
+(`bench/analyze_nsys_overlap.py`) into merged busy-intervals per stream
+and computed their intersection. Two numbers, and they tell two different
+stories:
+- **Overlap efficiency (achieved/ideal): 92.9%.** When the copy stream
+  and compute stream both have work queued, they overlap almost
+  perfectly (9.76ms of actual concurrent copy+compute out of 10.50ms
+  ideal). The double-buffering mechanism itself is not broken -- it's
+  about as good as physically possible.
+- **GPU idle 51.0% of wall-clock time** (85.1ms of 166.8ms) -- over half
+  the total time, *neither* the copy stream nor the compute stream has
+  anything running at all.
+
+This resolves the "no speedup" result completely: the ~10ms saved by
+overlap is real, but it's dwarfed by ~85ms of dead time where the GPU
+sits idle waiting on the CPU side -- Python dispatch overhead between the
+many small per-layer ops (`.view()`/`.contiguous()` calls, dict lookups
+in `WeightPipeline`/`StreamingModel`, individual kernel-launch overhead
+for ~30 tiny kernels per layer, `torch.cuda.current_stream().
+wait_event()` calls). Both the single-buffered and pipelined versions pay
+this SAME CPU-bound cost, which is why they measured identically --
+the thing I changed (overlap efficiency) genuinely improved, but it
+wasn't the bottleneck to begin with. Satisfies M6's actual acceptance
+wording ("Nsight Systems timeline shows copy and compute kernels
+genuinely overlapping... report the overlap efficiency (achieved vs
+ideal)") with a real number, not a demonstration that dodges the harder
+finding underneath it.
+
+**A smaller, related false lead along the way, also worth recording:**
+before reaching for `nsys`, tried a "fire all copies on 2 streams, sync
+once at the end" micro-benchmark with no compute involved at all, to
+sanity-check that concurrent transfers help. They didn't -- 21.2ms vs
+15.1ms sequential, i.e. *worse*. In hindsight this makes sense and isn't
+evidence against the pipeline design: two H2D copies issued concurrently
+still contend for the same physical PCIe link, so there's no bandwidth to
+gain from parallelizing transfer-with-transfer, only overhead to lose.
+The real overlap this project wants is transfer-with-*compute* (different
+hardware: DMA engine vs SM), which is exactly what the `nsys` numbers
+above confirm is working.
+
+**What actually would move the needle:** given the finding, the right
+next optimization is reducing CPU dispatch overhead -- CUDA graphs
+(capture the whole per-layer op sequence once, replay with near-zero
+per-launch CPU cost) is the standard tool for exactly this shape of
+problem (many small ops, batch-1 decode). Not implemented here -- a real
+follow-up, not a same-session fix. M6 is otherwise complete: roofline
+(8.69x transfer-bound), the real headline model (coherent generation,
+verified), and now the overlap efficiency number the acceptance criteria
+ask for.

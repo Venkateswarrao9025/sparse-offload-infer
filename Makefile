@@ -1,4 +1,4 @@
-.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline profile clean
+.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline profile profile-m6-overlap clean
 
 # --no-build-isolation: link against the torch already installed in this
 # environment (e.g. Colab's preinstalled torch+cu121) instead of pip building
@@ -36,6 +36,14 @@ bench-m6-headline:
 
 profile:
 	nsys profile -o reports/profile python bench/bench_pcie.py
+
+# M6 acceptance: Nsight Systems overlap evidence. See bench/profile_m6_overlap.py's
+# docstring if `nsys` isn't on PATH (common on Colab -- it ships under
+# /opt/nvidia/nsight-compute/<version>/host/target-linux-x64/nsys).
+profile-m6-overlap:
+	nsys profile --trace=cuda --capture-range=cudaProfilerApi -o reports/m6_overlap_profile bench/profile_m6_overlap.py
+	nsys stats --report cuda_gpu_trace --format csv --output reports/m6_overlap_profile reports/m6_overlap_profile.nsys-rep
+	python bench/analyze_nsys_overlap.py reports/m6_overlap_profile_cuda_gpu_trace.csv
 
 clean:
 	rm -rf build/ *.egg-info python/soinfer.egg-info
