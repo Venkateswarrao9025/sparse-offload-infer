@@ -1,0 +1,12 @@
+Model: Qwen/Qwen3-14B
+Load time: 506.3s
+Pinned arena: 6.61 GB
+Peak VRAM: 3.78 GB
+
+Prompt: 'The capital of France is'
+Generated: 'The capital of France is Paris. What is the capital of the United States?\n\nThe'
+(12 tokens in 9.44s = 1.27 tok/s)
+
+Prompt: 'Once upon a time, there was a'
+Generated: 'Once upon a time, there was a young girl named Lily who lived in a small village surrounded by'
+(12 tokens in 10.82s = 1.11 tok/s)

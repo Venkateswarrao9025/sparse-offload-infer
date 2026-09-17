@@ -800,3 +800,67 @@ yet captured -- the roofline shows transfer *should* dominate, but doesn't
 by itself prove the double-buffering pipeline achieves good overlap
 efficiency in practice; that needs `nsys profile` on a real multi-layer
 decode loop.
+
+**M6 task 4 done: a real 14B model generates coherent text from streamed
+INT4 weights.** Checked with the user first (this needed a real resource
+commitment -- confirmed Colab free tier, no direct monetary cost, but a
+meaningful chunk of the free-tier GPU/RAM allowance) and picked Qwen3-14B
+over 32B specifically because the RAM math mattered: Colab free tier has
+~10GB available host RAM, and a 32B checkpoint's INT4-quantized form
+(~16GB) plain doesn't fit, while 14B's does (~6.6GB).
+
+The real engineering problem wasn't the GPU at all -- it was that
+Qwen3-14B's checkpoint is **28GB in bf16**, comfortably bigger than the
+~10GB of host RAM available. `transformers.AutoModelForCausalLM.
+from_pretrained` would materialize the whole thing in RAM and OOM before
+ever reaching quantization. The fix (`soinfer/offload/load_hf_checkpoint.py`):
+stream straight from the safetensors shards using `safe_open`'s lazy
+per-tensor access -- `get_slice(name).get_shape()` reads a tensor's shape
+from the file's JSON header without touching its data (a cheap first pass
+to size the pinned arena exactly, 6.606 GB, matching a hand-calculated
+estimate exactly), then `get_tensor(name)` materializes ONE weight at a
+time, which gets quantized, packed, and registered into the
+`PinnedWeightStore` immediately, with the bf16 copy freed before the next
+tensor. Peak *extra* RAM beyond the growing arena is one tensor (at most
+a few hundred MB for this model) -- the full checkpoint is never resident
+at once. This is the actual mechanism that makes "run a model bigger than
+convenient RAM" work, not just "bigger than VRAM" (VRAM turned out to be
+a complete non-issue here -- see below).
+
+**Two real Colab kernel crashes along the way, and what they taught.**
+Mid-session, the Colab Python kernel died and silently reconnected to a
+fresh one twice (diagnosed via `ps aux` showing a `<defunct>` zombie
+process and a new kernel PID/start time) -- almost certainly the Linux
+OOM killer, from residual pinned-memory pages that `del` + `gc.collect()`
+didn't actually release back to the OS (PyTorch's caching host allocator
+holds onto freed pinned pages for reuse rather than returning them
+immediately, so `free -h`'s "available" column stayed misleadingly low
+after supposedly freeing tens of GB of Python objects). Lesson: for a
+RAM-critical operation like this, don't trust incremental cleanup in a
+long-lived interactive session -- verify the *actual committed script*
+in a genuinely fresh kernel before trusting the result. Doing exactly
+that caught nothing new (the refactored, modularized version reproduced
+the interactive result byte-for-byte), but it was the right thing to
+check rather than assume, given two unexplained crashes in the same
+session.
+
+**The result** (`reports/m6_headline_generation.{csv,txt}`): load
+(stream-quantize all 40 layers) took 506s (~8.4 min) on a T4. Two
+prompts, both coherent, both matching what a 14B model should plausibly
+say:
+- "The capital of France is" -> "...Paris. What is the capital of the
+  United States?"
+- "Once upon a time, there was a" -> "...young girl named Lily who lived
+  in a small village surrounded by"
+
+Peak VRAM: **3.78 GB of 15 GB** -- nowhere close to the limit, confirming
+what the RAM analysis predicted: VRAM was never the constraint for this
+architecture (embeddings + LM head + norms resident, ~2.3GB; small
+per-layer staging buffers; a modest KV cache), host RAM during the
+*loading* phase was. Throughput: ~1.1-1.3 tokens/sec -- slow, and
+honestly reported as such: this run is deliberately correctness-first
+(single-buffered streaming, no cross-layer prefetch overlap; unfused
+Q/K/V, three separate GEMVs instead of M5's fused one). The M6 roofline
+already measured the overlap opportunity (8.69x); wiring `StreamManager`
+to actually prefetch layer i+1 while layer i computes, in this real loop,
+is the natural next pass, not a fix for a correctness problem.
