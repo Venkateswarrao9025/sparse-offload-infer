@@ -1103,3 +1103,92 @@ M7 task 3 is functionally complete: both sparse GEMV paths exist and are
 verified. Byte-savings-per-token instrumentation (task 4's actual
 subject) and the k-sweep Pareto curve (perplexity vs tokens/sec) are the
 remaining M7 work.
+
+### 2026-09-17 -- M7 task 4: wiring DIP in surfaced a real M6 bug (non-deterministic greedy decode)
+
+**The wiring itself went smoothly; a smoke test exposed something much
+more important.** `run_decoder_layer_dip`/`generate_dip` (gate dense,
+top-k select, gather up_proj/down_proj_T's k rows straight from the
+pinned arena, both sparse GEMVs) came together with only one real fix
+along the way: `generate.py` had hardcoded `GROUP_SIZE = 128` as a module
+constant instead of reading whatever group_size a model's arena was
+actually quantized with -- silently wrong for anyone loading with a
+different group_size (every real caller in this repo happens to use 128,
+so this never fired before M7 task 4's synthetic integration test used
+32 to get a meaningful multi-group check at its small test dims). Fixed
+by adding `group_size` to `StreamingModel` and reading `model.group_size`
+throughout. First error: 493.5 max diff. After the fix: still non-trivial
+(146.5), but now attributable to something real and different -- see below.
+
+**Then `bench_m7_pareto.py` produced a nonsensical perplexity: 63 million
+on Qwen3-1.7B** (worse than random guessing over a 151936-token vocab,
+which would be ~150000). Before assuming the new eval code was wrong,
+the cheapest differential check was comparing THIS project's own
+`generate_streaming` against real HF generation on the same prompt --
+Qwen3-1.7B's *streaming* path (`load_streaming_model`) had only ever been
+validated end-to-end on the 14B headline model (M6, "coherent text," a
+qualitative eyeball check); the smaller model was new territory. First
+sign of trouble: printing the SAME greedy call's tokens twice gave
+different token IDs. Greedy decode (do_sample=False, no randomness
+anywhere in the math) producing different output on identical repeated
+calls is impossible if everything is deterministic -- a dead giveaway of
+an uncontrolled race, not a numerics problem. Four repeated calls
+confirmed it: four different continuations from the identical prompt on
+the identical model.
+
+**Root cause: `StreamManager`'s double buffer only enforced one of the two
+orderings a shared buffer needs.** `events[buf_idx]` made the compute
+stream wait for a buffer's copy to finish before reading it (read-after-write,
+handled). But nothing made the COPY stream wait for the PREVIOUS
+GEMV's read of that same buffer to finish before overwriting it
+(write-after-read -- missing entirely). `WeightPipeline` alternates 2
+buffers, so buffer 0 gets read by GEMV call N, then isn't touched again
+until the PREFETCH inside call N+2 overwrites it -- with no dependency
+edge between "GEMV N reads buf 0" and "prefetch N+2 writes buf 0," the
+two independent CUDA streams involved (default/compute stream, copy
+stream 0) could race, and whichever finished first each time nondeterministically
+decided whether the GEMV read old or new data. This is a genuine, if
+narrow, race window: it only matters if the NEXT prefetch's copy can
+plausibly start before the PREVIOUS GEMV's read finishes, which requires
+copy latency to be comparable to (or shorter than) compute latency for
+neighboring weights. Qwen3-14B's per-weight GEMV compute time is large
+enough that this apparently never happened to lose the race in practice
+(every M6 test and the "coherent text" check all happened to pass by
+timing luck, not by correctness); Qwen3-1.7B's much smaller, faster
+GEMVs made the race trigger essentially every call.
+
+**This means M6's own acceptance evidence was quietly incomplete** --
+"verified" meant "verified at 14B's scale," not "verified regardless of
+model size," and the actual synchronization bug had been sitting in
+this project's tested, merged, reviewed M6 code the entire time. Nothing
+in M6's test suite (`test_offload.py`) caught it because those tests check
+StreamManager's OWN correctness (does a prefetched buffer contain the
+right bytes) in isolation, never a tight alternating read/write cycle
+across many iterations under real timing pressure -- exactly the gap a
+unit test's controlled pacing tends to paper over and only a longer,
+faster, real workload exposes.
+
+**Fix:** `StreamManager` gains `read_done_events` (one per buffer) and
+`mark_read_done(buf_idx)`; `prefetch()` now makes the copy stream wait on
+the buffer's `read_done_event` before writing (`stream.wait_event(...)`
+on a never-recorded event is a documented no-op, which is exactly right
+for a buffer's very first prefetch, before anything has ever read it).
+`WeightPipeline.next_gemv` calls `mark_read_done(cur_buf)` immediately
+after launching cur_buf's GEMV. Verified: 4/4 repeated greedy calls on
+Qwen3-1.7B now give byte-identical output, matching real HF's own greedy
+continuation ("The capital of France is Paris, and the capital of the
+United States is" -- coherent, matches the shape of HF's own output).
+Full test suite (143/143) still passes -- the fix adds ordering, it
+doesn't change any buffer's final contents. `make profile-m6-overlap`
+re-verification (does the extra wait dependency cost any of the 94%
+overlap efficiency M6 reported) is a natural follow-up, not yet done.
+
+**Why this is worth dwelling on:** this is the single most consequential
+finding of the M7 session so far -- not because DIP's own kernels had a
+bug (they didn't; tasks 1-3's kernel-level tests were never in question),
+but because it demonstrates precisely the failure mode this project's own
+rule ("verify on real hardware, never claim success without it") exists
+to catch, AND shows that hardware verification at ONE scale doesn't
+generalize to correctness at another. The lesson generalizes past this
+one race: any claim of "verified" from here on should say verified on
+WHAT, at WHAT scale, under WHAT load -- not just verified.
