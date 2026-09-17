@@ -989,3 +989,58 @@ cross-block reduction), or (2) a proper radix-select (bucket by
 exponent/mantissa bits, no per-iteration full-array rescan needed) --
 the more standard GPU top-k approach and likely the bigger win, since it
 avoids the 24x redundant full-array scan this bisection design pays for.
+
+### 2026-09-17 -- M7 task 2: row gather (staged vs per-row cudaMemcpyAsync)
+
+**The spec's prediction held up cleanly, first try.** Two variants,
+both implemented as raw C++/CUDA functions (not Python loops -- see
+below for why that matters) over a `PinnedWeightStore`-style matrix:
+`gather_rows_staged` does a host-side `memcpy` of each selected row into
+a contiguous pinned staging buffer, then ONE `cudaMemcpyAsync` H2D of the
+whole block; `gather_rows_naive` issues one `cudaMemcpyAsync` per
+selected row, straight from its scattered offset in the pinned arena.
+11 correctness tests pass (byte-exact match against a CPU
+`index_select` reference for both variants, at sizes up to Qwen3-14B's
+real up/down-proj row shape, plus a direct check that the two variants
+produce identical output given identical input -- they should differ
+only in transfer pattern, never in result).
+
+`bench/bench_m7_gather.py` sweeps the same I/k grid as task 1's topk
+bench, using Qwen3-14B's real row shape (row_nbytes=2560, the INT4-packed
+width of one row at hidden_size=5120). At the spec's own acceptance
+point (num_rows=17408, k=0.5*num_rows): **staged=5.65ms vs naive=24.27ms,
+a 4.29x slowdown for going row-by-row.** Across the full sweep the ratio
+ranges 3.09x-12.68x, worse (not better) at smaller k in most rows -- makes
+sense, since per-call overhead is a fixed cost per transfer, so it's a
+proportionally larger tax when each transfer carries fewer bytes.
+`reports/m7_gather_timing.csv` has the full I x k/I grid, all 18 points
+naive-slower-than-staged. This is exactly the "compare against per-row
+cudaMemcpyAsync (it will be far worse -- show the data)" the spec
+predicts (PROJECT_SPEC.md M7 task 2), and it was true without needing a
+second round of tuning -- unlike task 1, where the first correctness-first
+design missed its performance target and needed real rework.
+
+**Deliberately NOT implemented as Python-level `.copy_(non_blocking=True)`
+loops, and that choice is itself worth recording.** M6's Nsight Systems
+finding this session (see the 2026-09-XX M6 entry above) showed that at
+small-per-op granularity, Python/ATen call dispatch overhead can dominate
+measurements and mask the actual hardware-level effect being tested. If
+"per-row transfer" had been benchmarked as N separate Python-level
+`tensor.copy_()` calls, a measured slowdown could not be cleanly
+attributed to "many small PCIe transfers are inherently worse than one
+large one" -- it could just as easily be "Python dispatched N kernel
+launches instead of 1," a different and much less interesting claim.
+Doing both variants as tight C++ loops calling the CUDA runtime API
+directly (`gather_rows.cu`, no `__global__` kernel needed -- the "kernel"
+here is host-side orchestration of `cudaMemcpyAsync` calls, plus a plain
+`std::memcpy` for the staging gather) isolates the actual claim the spec
+is making, about transfer pattern, not about which language issues the
+calls.
+
+M7 task 2 acceptance is met: bytes transferred are instrumented directly
+(`bytes_transferred` column, not inferred from timing), and the naive
+baseline is measurably, substantially worse across the whole sweep.
+Row gather from a pinned arena into a sparse GEMV's staging buffer is now
+demonstrated as the right primitive; task 3 (sparse fused GEMV restricted
+to the selected index set) is what actually turns this saved-bytes result
+into a saved-bytes-*per-token* system-level number.
