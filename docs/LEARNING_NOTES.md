@@ -609,3 +609,54 @@ real numbers on the first pass. Good data point: the M4 near-misses were
 about genuinely hard problems (dequant bit tricks, memory coalescing under
 a shared per-group scale), not a general sign that "nothing works without
 three iterations" -- straightforward kernels built carefully can just work.
+
+**RoPE and Qwen3 QK-norm, read from the actual transformers source rather
+than from memory.** Same session: `inspect.getsource()` on
+`qwen3_mod.rotate_half`, `apply_rotary_pos_emb`, `Qwen3RotaryEmbedding`,
+`Qwen3Attention`, and `Qwen3RMSNorm` directly on Colab (transformers is
+already installed there) instead of recalling the RoPE convention from
+training data -- this project's own experience with the M4 LOP3 kernel
+was exactly a case where a remembered/derived convention needed real
+verification, so there was no reason to trust memory here when the actual
+source was one `inspect.getsource()` away. Confirmed: QK-norm is plain
+`RMSNorm(head_dim)` per head (so `qk_norm` in ops.py is a zero-new-code
+rename of the M2 `rmsnorm` kernel), and RoPE is the standard "rotate-half"
+/ NEOX convention (`cos`/`sin` built by duplicating a length-head_dim/2
+`freqs` vector, `out = x*cos + rotate_half(x)*sin`). `rope.cu` implements
+the reduced two-line-per-pair form of that formula directly (derivation in
+the file's header comment). Both were tested against the real HF functions
+(`test_apply_rope_matches_huggingface_qwen3`, `test_qk_norm_matches_huggingface_qwen3`),
+not an independently-derived reference -- and both passed on the real T4
+without any bugs.
+
+**Close-out: a full decoder layer matches real HuggingFace Qwen3, verified
+live.** With every M5 piece now built and RoPE/QK-norm done, assembled one
+full `Qwen3DecoderLayer` forward pass (input RMSNorm -> fused QKV ->
+QK-norm -> RoPE -> KV cache append -> decode attention -> `o_proj` ->
+residual -> post-attention RMSNorm -> fused SwiGLU MLP -> residual)
+entirely from `soinfer.ops` kernels, using weights pulled directly out of
+a real (randomly-initialized, Qwen3-1.7B-shaped) `Qwen3DecoderLayer` --
+same weights feed both my pipeline and the HF reference, so any mismatch
+is purely a bug in the kernels/assembly, not a weight-loading issue.
+First result: max abs diff ~0.002 (about 1 FP16 ULP), and a max *relative*
+diff of 3.8% that looked alarming until checked -- it was one output
+element near zero (`hf_out=0.00061`) where a tiny absolute error produces
+a large ratio. Excluding elements with `|hf_out| < 0.05` (rounding noise,
+not signal), max relative error is **0.26%**, well inside PROJECT_SPEC.md
+M5's own acceptance bound (`< 2e-2`). Wrote this up as
+`tests/test_layer_parity.py` -- exactly the milestone's own backbone test
+("a full transformer block, your implementation vs HF, max relative error
+< 2e-2 on real activations") -- parametrized over position 0/5/100 (0
+matters specifically because RoPE is the identity there, so it's the one
+case that *wouldn't* catch a RoPE bug; 5 and 100 do exercise real
+rotation). All 3 pass on the real T4. This is M5's real headline result:
+every non-skipped task (1-4, plus the RoPE/QK-norm work needed to actually
+use them) composes into a working, HF-matching transformer layer.
+
+**Still open for M5/M6:** `test_end_to_end.py` (greedy decode matching HF
+token-for-token across a full multi-layer model + generation loop) is the
+next real target -- this single-layer parity result is necessary but not
+sufficient for it (error could still compound across layers/steps in a way
+a single-layer test can't see). Also open: INT8 tensor-core GEMM (M4's
+optional stretch task), and the paged KV-cache layout (M5 task 3's stretch
+goal, currently contiguous-only).
