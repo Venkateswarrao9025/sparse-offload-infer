@@ -124,6 +124,11 @@ class WeightPipeline:
         nbytes = m.n * m.handle.row_nbytes
         view = self.bufs[self.cur_buf][:nbytes].view(m.n, m.handle.row_nbytes)
         result = ops.gemv_w4a16_group_lop3(view, m.scale, x_in, m.packed_k, self.model.group_size)
+        # This GEMV is cur_buf's reader -- mark it so the prefetch that
+        # eventually reuses cur_buf (two next_gemv calls from now, once the
+        # buffer index cycles back) waits for this read to finish before
+        # overwriting it. See StreamManager.prefetch's docstring.
+        self.sm.mark_read_done(self.cur_buf)
 
         next_buf = 1 - self.cur_buf
         next_name = next(self._names)
