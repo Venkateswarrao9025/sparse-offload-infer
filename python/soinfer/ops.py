@@ -148,6 +148,16 @@ def fused_qkv_projection(
     return q, k, v
 
 
+def topk_threshold_select(abs_g: torch.Tensor, k: int) -> torch.Tensor:
+    """Returns the k indices of abs_g's largest values (unordered). abs_g: 1D float32 CUDA
+    tensor, non-negative (e.g. |gate_proj(x)|, the SwiGLU gate activation magnitude M7 selects
+    channels from). Single kernel launch: binary-searches a threshold within one block (no
+    host round-trips between search iterations -- see csrc/kernels/topk_select.cuh), then
+    compacts qualifying indices. M7."""
+    indices, _count = _C.topk_threshold_select(abs_g, k)
+    return indices
+
+
 def precompute_rope_cos_sin(head_dim: int, theta: float, pos: int, device, dtype=torch.float32):
     """cos/sin for RoPE at absolute position `pos`, matching HF's Qwen3RotaryEmbedding exactly:
     inv_freq[i] = 1/theta^(2i/head_dim) for i in [0, head_dim/2), angle_i = pos*inv_freq[i]. M5."""

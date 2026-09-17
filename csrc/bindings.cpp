@@ -2,6 +2,7 @@
 #include <cuda_fp16.h>
 
 #include <cmath>
+#include <tuple>
 
 #include "kernels/decode_attention.cuh"
 #include "kernels/elementwise.cuh"
@@ -15,6 +16,7 @@
 #include "kernels/softmax_online.cuh"
 #include "kernels/strided_copy.cuh"
 #include "kernels/swiglu_fused.cuh"
+#include "kernels/topk_select.cuh"
 #include "kernels/transpose.cuh"
 
 namespace {
@@ -356,6 +358,19 @@ void rope_apply(torch::Tensor x, torch::Tensor cos_vals, torch::Tensor sin_vals)
                        static_cast<int>(head_dim));
 }
 
+std::tuple<torch::Tensor, torch::Tensor> topk_threshold_select(torch::Tensor abs_g, int64_t k) {
+    check_f32_cuda_contiguous(abs_g, "topk_threshold_select(abs_g)");
+    TORCH_CHECK(abs_g.dim() == 1, "topk_threshold_select: abs_g must be 1D [I]");
+    TORCH_CHECK(k >= 1 && k <= abs_g.size(0), "topk_threshold_select: k must be in [1, I]");
+
+    const int64_t n = abs_g.size(0);
+    auto out_indices = torch::empty({k}, abs_g.options().dtype(torch::kInt32));
+    auto out_count = torch::empty({1}, abs_g.options().dtype(torch::kInt32));
+    launch_topk_threshold_select(abs_g.data_ptr<float>(), static_cast<int>(n), static_cast<int>(k),
+                                  out_indices.data_ptr<int32_t>(), out_count.data_ptr<int32_t>());
+    return {out_indices, out_count};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("add_one", &add_one, "Add 1.0 to every element of a float32 CUDA tensor (M0 toolchain smoke test)");
     m.def("vector_add", &vector_add, "out = a + b, elementwise (M1)");
@@ -387,4 +402,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Single-query GQA decode attention over a KV cache, online-softmax, fp32 accumulation (M5)");
     m.def("rope_apply", &rope_apply,
           "Applies RoPE (rotate-half convention, matching HF exactly) to x [num_heads, head_dim] in place (M5)");
+    m.def("topk_threshold_select", &topk_threshold_select,
+          "Selects the k largest-magnitude indices via single-launch binary-search threshold + compact (M7)");
 }
