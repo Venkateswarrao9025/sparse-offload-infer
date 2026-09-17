@@ -214,6 +214,7 @@ class DipBuffers:
 def run_decoder_layer_dip(
     pipeline: WeightPipeline, model: StreamingModel, layer_idx: int, x_flat: torch.Tensor, pos: int,
     k_cache: torch.Tensor, v_cache: torch.Tensor, dip_k: int, bufs: DipBuffers,
+    channel_counts: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """M7: same attention block as run_decoder_layer_streaming (q/k/v/o
     still fully dense-streamed through `pipeline`), but the MLP only
@@ -230,7 +231,14 @@ def run_decoder_layer_dip(
     see LEARNING_NOTES.md's M7 task 4 entry for why that's an honest,
     documented limitation rather than an oversight). Consumed by M7 task
     3's two sparse GEMVs: up reuses gemv_w4a16_group_lop3 (M4) with
-    N=dip_k; down uses the new gemv_w4a16_sparse_accumulate."""
+    N=dip_k; down uses the new gemv_w4a16_sparse_accumulate.
+
+    channel_counts (M8 task 1): optional list of `num_layers` [intermediate_size]
+    int64 CUDA tensors -- if given, this layer's selected channel indices
+    are scatter-added into `channel_counts[layer_idx]` (1 per selection),
+    building the per-channel selection-frequency histogram M8's calibration
+    pass needs. None (the default) skips this entirely, at zero cost to
+    the M7 decode path."""
     NQ, NKV, HD = model.num_attention_heads, model.num_key_value_heads, model.head_dim
     eps, theta = model.rms_norm_eps, model.rope_theta
     norms = model.layer_norms[layer_idx]
@@ -261,6 +269,8 @@ def run_decoder_layer_dip(
     abs_g = gate.float().abs().contiguous()
     idx = ops.topk_threshold_select(abs_g, dip_k)  # [dip_k] int32, CUDA
     idx_long = idx.long()
+    if channel_counts is not None:
+        channel_counts[layer_idx].scatter_add_(0, idx_long, torch.ones_like(idx_long))
     idx_cpu = idx_long.cpu()  # gather_rows_staged's host-side memcpy needs host-resident indices
 
     up_lm = model.matrices[f"model.layers.{layer_idx}.mlp.up_proj.weight"]
@@ -418,3 +428,36 @@ def teacher_forced_nll(model: StreamingModel, layer_fn, token_ids: list[int], ma
         count += 1
 
     return total_nll / count
+
+
+def calibrate_channel_frequencies(model: StreamingModel, token_ids: list[int], dip_k: int,
+                                   max_seq_len: int = 512) -> list[torch.Tensor]:
+    """M8 task 1: runs `token_ids` through the DIP decode path (teacher-
+    forced, like teacher_forced_nll -- calibration data is a representative
+    corpus fed through the model, not autoregressive sampling) and records
+    how often each intermediate channel gets selected by top-k, per layer.
+    "The skew is the story" (PROJECT_SPEC.md M8 task 1) -- this is the
+    building block hot_cache.py's static-frequency policy and
+    bench_m8_calibration.py's histogram plot both consume.
+
+    Returns a list of `num_layers` [intermediate_size] int64 CUDA tensors,
+    one per layer, channel_counts[layer][c] == how many of len(token_ids)
+    tokens selected channel c."""
+    I = model.matrices["model.layers.0.mlp.up_proj.weight"].n
+    channel_counts = [torch.zeros(I, dtype=torch.int64, device="cuda") for _ in range(model.num_layers)]
+
+    NKV, HD = model.num_key_value_heads, model.head_dim
+    k_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
+    v_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
+    pipeline = WeightPipeline(model, suffixes=DIP_DENSE_SUFFIXES)
+    bufs = DipBuffers.make(model, max_k=dip_k)
+
+    for pos, tok in enumerate(token_ids):
+        x = model.embed_tokens[tok].contiguous()
+        for layer_idx in range(model.num_layers):
+            x = run_decoder_layer_dip(
+                pipeline, model, layer_idx, x, pos, k_caches[layer_idx], v_caches[layer_idx], dip_k, bufs,
+                channel_counts=channel_counts,
+            )
+
+    return channel_counts
