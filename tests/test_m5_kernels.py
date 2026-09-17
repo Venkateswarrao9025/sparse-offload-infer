@@ -210,3 +210,81 @@ def test_decode_attention_after_kv_cache_append_matches_reference():
     expected = decode_attention_ref(q, k_cache, v_cache, n_tokens)
     actual = soinfer.ops.decode_attention(q, k_cache, v_cache, n_tokens)
     assert_gemv_matches(actual, expected, "decode_attention[after kv_cache_append]")
+
+
+# ---------------------------------------------------------------------------
+# RoPE (needed before layer-parity/end-to-end tests can run; not one of M5's
+# named task files but required by task 4's real use)
+# ---------------------------------------------------------------------------
+
+
+def rope_math_ref(x: torch.Tensor, cos_half: torch.Tensor, sin_half: torch.Tensor) -> torch.Tensor:
+    """Pure-math rotate-half reference (see csrc/kernels/rope.cuh's derivation comment) -- doesn't
+    need transformers installed, unlike test_apply_rope_matches_huggingface_qwen3 below."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    out = torch.empty_like(x)
+    out[..., :half] = x1 * cos_half - x2 * sin_half
+    out[..., half:] = x2 * cos_half + x1 * sin_half
+    return out
+
+
+def test_apply_rope_matches_math_reference():
+    torch.manual_seed(6)
+    num_heads, head_dim, theta, pos = 16, 128, 1_000_000.0, 37  # theta matches Qwen3-1.7B's rope_theta
+    x = torch.randn(num_heads, head_dim, device="cuda", dtype=torch.float16)
+    cos_vals, sin_vals = soinfer.ops.precompute_rope_cos_sin(head_dim, theta, pos, device="cuda")
+
+    expected = rope_math_ref(x.float(), cos_vals.float(), sin_vals.float()).half()
+    actual = soinfer.ops.apply_rope(x.clone(), cos_vals, sin_vals)
+    assert_gemv_matches(actual, expected, "apply_rope vs math reference")
+
+
+def test_apply_rope_matches_huggingface_qwen3():
+    """The real correctness bar: match transformers' actual Qwen3 rotate_half +
+    apply_rotary_pos_emb, not just an independently-derived formula."""
+    pytest.importorskip("transformers")
+    from transformers.models.qwen3 import modeling_qwen3 as qwen3_mod
+
+    torch.manual_seed(7)
+    num_heads, head_dim, theta, pos = 16, 128, 1_000_000.0, 37
+    x = torch.randn(num_heads, head_dim, device="cuda", dtype=torch.float16)
+
+    # Reproduce Qwen3RotaryEmbedding.forward's cos/sin construction for one absolute position.
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device="cuda") / head_dim))
+    freqs = pos * inv_freq
+    emb = torch.cat([freqs, freqs])
+    cos_full = emb.cos().half()
+    sin_full = emb.sin().half()
+
+    # HF's apply_rotary_pos_emb expects q/k as [batch, heads, seq, head_dim] and cos/sin as
+    # [batch, seq, head_dim] (before its own internal unsqueeze_dim=1 insert).
+    q_hf = x.unsqueeze(0).unsqueeze(2)
+    cos_hf = cos_full.unsqueeze(0).unsqueeze(0)
+    sin_hf = sin_full.unsqueeze(0).unsqueeze(0)
+    q_rot_hf, _ = qwen3_mod.apply_rotary_pos_emb(q_hf, q_hf, cos_hf, sin_hf, unsqueeze_dim=1)
+    expected = q_rot_hf.squeeze(0).squeeze(1)
+
+    cos_vals, sin_vals = soinfer.ops.precompute_rope_cos_sin(head_dim, theta, pos, device="cuda")
+    actual = soinfer.ops.apply_rope(x.clone(), cos_vals, sin_vals)
+    assert_gemv_matches(actual, expected, "apply_rope vs HF Qwen3 apply_rotary_pos_emb")
+
+
+def test_qk_norm_matches_huggingface_qwen3():
+    """q_norm/k_norm in Qwen3Attention is exactly RMSNorm(head_dim) per head -- confirm
+    soinfer.ops.qk_norm (a thin rename of the existing M2 rmsnorm kernel) matches HF's
+    Qwen3RMSNorm bit-for-bit-close, not just the generic RMSNorm formula."""
+    pytest.importorskip("transformers")
+    from transformers.models.qwen3 import modeling_qwen3 as qwen3_mod
+
+    torch.manual_seed(8)
+    num_heads, head_dim, eps = 16, 128, 1e-6
+    x = torch.randn(num_heads, head_dim, device="cuda", dtype=torch.float16)
+    weight = torch.randn(head_dim, device="cuda", dtype=torch.float16)
+
+    hf_norm = qwen3_mod.Qwen3RMSNorm(head_dim, eps=eps).cuda().half()
+    hf_norm.weight.data.copy_(weight)
+    expected = hf_norm(x)
+
+    actual = soinfer.ops.qk_norm(x, weight, eps)
+    assert_gemv_matches(actual, expected, "qk_norm vs HF Qwen3RMSNorm")

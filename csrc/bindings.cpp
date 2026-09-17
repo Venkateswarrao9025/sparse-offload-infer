@@ -11,6 +11,7 @@
 #include "kernels/kv_cache.cuh"
 #include "kernels/reduce_demo.cuh"
 #include "kernels/rmsnorm.cuh"
+#include "kernels/rope.cuh"
 #include "kernels/softmax_online.cuh"
 #include "kernels/strided_copy.cuh"
 #include "kernels/swiglu_fused.cuh"
@@ -338,6 +339,23 @@ torch::Tensor decode_attention(torch::Tensor q, torch::Tensor k_cache, torch::Te
     return out;
 }
 
+void rope_apply(torch::Tensor x, torch::Tensor cos_vals, torch::Tensor sin_vals) {
+    check_f16_cuda_contiguous(x, "rope_apply(x)");
+    TORCH_CHECK(x.dim() == 2, "rope_apply: x must be 2D [num_heads, head_dim]");
+    TORCH_CHECK(x.size(1) % 2 == 0, "rope_apply: head_dim must be even");
+    TORCH_CHECK(cos_vals.is_cuda() && cos_vals.scalar_type() == torch::kFloat32 && cos_vals.is_contiguous(),
+                "rope_apply: cos_vals must be a contiguous float32 CUDA tensor");
+    TORCH_CHECK(sin_vals.sizes() == cos_vals.sizes() && sin_vals.is_cuda() &&
+                    sin_vals.scalar_type() == torch::kFloat32 && sin_vals.is_contiguous(),
+                "rope_apply: sin_vals must match cos_vals (contiguous float32 CUDA, same shape)");
+    TORCH_CHECK(cos_vals.dim() == 1 && cos_vals.size(0) == x.size(1) / 2,
+                "rope_apply: cos_vals/sin_vals must be 1D [head_dim / 2]");
+
+    const int64_t num_heads = x.size(0), head_dim = x.size(1);
+    launch_rope_apply(half_ptr(x), cos_vals.data_ptr<float>(), sin_vals.data_ptr<float>(), static_cast<int>(num_heads),
+                       static_cast<int>(head_dim));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("add_one", &add_one, "Add 1.0 to every element of a float32 CUDA tensor (M0 toolchain smoke test)");
     m.def("vector_add", &vector_add, "out = a + b, elementwise (M1)");
@@ -367,4 +385,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Append one token's K/V into a contiguous [num_kv_heads, max_seq_len, head_dim] cache at `pos` (M5)");
     m.def("decode_attention", &decode_attention,
           "Single-query GQA decode attention over a KV cache, online-softmax, fp32 accumulation (M5)");
+    m.def("rope_apply", &rope_apply,
+          "Applies RoPE (rotate-half convention, matching HF exactly) to x [num_heads, head_dim] in place (M5)");
 }

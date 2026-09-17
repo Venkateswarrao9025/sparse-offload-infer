@@ -148,6 +148,30 @@ def fused_qkv_projection(
     return q, k, v
 
 
+def precompute_rope_cos_sin(head_dim: int, theta: float, pos: int, device, dtype=torch.float32):
+    """cos/sin for RoPE at absolute position `pos`, matching HF's Qwen3RotaryEmbedding exactly:
+    inv_freq[i] = 1/theta^(2i/head_dim) for i in [0, head_dim/2), angle_i = pos*inv_freq[i]. M5."""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
+    angles = pos * inv_freq
+    return angles.cos().to(dtype).contiguous(), angles.sin().to(dtype).contiguous()
+
+
+def apply_rope(x: torch.Tensor, cos_vals: torch.Tensor, sin_vals: torch.Tensor) -> torch.Tensor:
+    """Applies RoPE to x [num_heads, head_dim] half IN PLACE (rotate-half convention, matches HF's
+    apply_rotary_pos_emb exactly -- see csrc/kernels/rope.cuh's derivation). cos_vals/sin_vals:
+    [head_dim/2] float32, from precompute_rope_cos_sin. Returns x for chaining. M5."""
+    _C.rope_apply(x, cos_vals, sin_vals)
+    return x
+
+
+def qk_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Qwen3-style per-head QK-norm: plain RMSNorm over head_dim, independently per head. x:
+    [num_heads, head_dim] half, weight: [head_dim] half. Reuses the M2 rmsnorm kernel directly --
+    Qwen3Attention's q_norm/k_norm IS exactly RMSNorm(head_dim) applied per head, no new kernel
+    needed. M5."""
+    return rmsnorm(x, weight, eps)
+
+
 def kv_cache_append(k_cache: torch.Tensor, v_cache: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor, pos: int) -> None:
     """Writes k_new/v_new (each [num_kv_heads, head_dim] half) into k_cache/v_cache (each
     [num_kv_heads, max_seq_len, head_dim] half) at sequence position `pos`, in place. Contiguous

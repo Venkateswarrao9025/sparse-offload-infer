@@ -35,6 +35,7 @@ ext_modules = [
             os.path.join(CSRC_DIR, "kernels", "swiglu_fused.cu"),
             os.path.join(CSRC_DIR, "kernels", "kv_cache.cu"),
             os.path.join(CSRC_DIR, "kernels", "decode_attention.cu"),
+            os.path.join(CSRC_DIR, "kernels", "rope.cu"),
         ],
         include_dirs=[
             os.path.join(CSRC_DIR, "include"),

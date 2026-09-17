@@ -592,10 +592,20 @@ would catch. Scoped out for now rather than guessed at; needed before
 `test_layer_parity.py`/`test_end_to_end.py` can actually run, and is the
 first thing to build once Colab is back.
 
-**Next session, once Colab is reachable:** `make build && make test`,
-watch `test_m5_kernels.py` particularly closely on `decode_attention` (the
-`block_reduce_sum` broadcast pattern and the GQA head-grouping math are the
-two places most likely to have a subtle bug) and `kv_cache_append`+
-`decode_attention` together (the end-to-end-ish test). Then RoPE (+
-Qwen3's QK-norm) is the real blocker before a full-layer HF parity test is
-even possible.
+**Close-out: verified on a real T4, same session, first try.** Found a new
+Colab tab, set it to a T4 runtime, fresh clone, `make build` (all of
+swiglu_fused.cu/kv_cache.cu/decode_attention.cu compiled clean), `pytest
+tests/ -v` -- **95/95 passed**, including all of tasks 1-4: fused SwiGLU
+matches the SiLU/matmul reference, fused QKV matches per-matrix GEMVs,
+`kv_cache_append` writes exactly the target position and nothing else, and
+`decode_attention` matches the reference at cur_len=1/17/300 plus the
+combined append-then-attend test. No bugs surfaced this time -- unlike
+M4's LOP3 kernel (which needed a from-scratch bit-trick derivation with
+real risk of a subtle error) and unlike the M4 coalescing disaster, these
+four kernels were architecturally simpler (no bit-packing, no novel access
+pattern) and the design reasoning (block_reduce_sum broadcast, GQA
+grouping order checked against HF's actual `repeat_kv`) held up against
+real numbers on the first pass. Good data point: the M4 near-misses were
+about genuinely hard problems (dequant bit tricks, memory coalescing under
+a shared per-group scale), not a general sign that "nothing works without
+three iterations" -- straightforward kernels built carefully can just work.
