@@ -1255,3 +1255,66 @@ the arena's own bookkeeping (`dip_bytes_per_token`, not inferred from
 timing), and perplexity is a real, quantified number at every point,
 including the honest finding that it's not a smooth curve. M7 is
 functionally complete (tasks 1-4 all done and verified); M8 is next.
+
+### 2026-09-17 -- M8 tasks 1-3: built with no GPU access -- what's actually verified
+
+**Mid-M8, the Colab session stopped responding to the MCP bridge** (cells
+reporting success but never actually executing -- `execution_count`
+stayed `null` even after repeated reconnect attempts), and separately the
+user hit Colab's free-tier GPU quota. This is the first time this project
+has had to make real progress with NO hardware verification available at
+all -- worth recording exactly what that changed about how the work got
+done, since the discipline ("never claim success without hardware
+verification") this project has followed all along doesn't stop
+mattering just because hardware isn't reachable; it means being explicit
+about what's actually confirmed versus staged.
+
+**What got GENUINELY verified, for real, without any GPU:** M8 task 2's
+cache-policy logic. `soinfer.offload.hot_cache`'s three policies
+(`StaticFrequencyPolicy`, `LRUPolicy`, `LFUDecayPolicy`, plus
+`compare_policies`) are pure Python/CPU bookkeeping over a trace of
+per-token selected-channel-index sets -- no tensors on a device, no
+kernels, nothing CUDA-shaped at all. Recognizing that this ONE piece of
+M8 had no hardware dependency at all was the key move: instead of staging
+everything equally as "written but unverified," 16 real tests
+(`tests/test_hot_cache.py`) ran on this local (no-NVIDIA-GPU) machine and
+actually passed -- hand-computed hit-rate traces for LRU/LFU eviction
+order, the tie-break direction (lower channel index wins, matching
+PROJECT_SPEC.md M8 task 2's determinism requirement), a monotonicity
+property (larger cache never hurts hit rate, checked across both adaptive
+policies), and a check that policies don't depend on `topk_threshold_select`'s
+own unordered (atomicAdd-race) output order. This is real, not staged --
+the same bar as every other test in this project, just run on a different
+machine.
+
+**What's built but genuinely NOT verified, and is documented as such:**
+- M8 task 1 (`generate.calibrate_channel_frequencies`/`calibrate_with_trace`,
+  `bench_m8_calibration.py`): needs a real model on GPU to produce actual
+  histogram data. Code written, syntax-checked, reasoned through, but the
+  "skew is the story" plot doesn't exist yet -- there's no real calibration
+  data to plot.
+- M8 task 2's OTHER half (`HotCache`, the GPU-resident cache class):
+  needs CUDA to build (it calls `gather_rows_staged` against a real
+  arena). Kept behind local imports specifically so it wouldn't block the
+  policy-simulation half's no-GPU testability, but it is itself unverified.
+- M8 task 3 (`gemv_dip_fused.cu`, the spec's stated "centerpiece"):
+  entirely unverified. Written by directly adapting M4's
+  `gemv_w4a16_group_lop3` and M7's `gemv_w4a16_sparse_accumulate` (both
+  already hardware-verified) to resolve each row's base pointer from a
+  descriptor instead of a fixed buffer -- the actual NEW surface area is
+  small and mechanical (pointer resolution, not new numerics), which is
+  some reassurance, but "should work because it's a small diff from
+  working code" is exactly the kind of claim this project's own rules
+  exist to not accept at face value. The predicated-pointer-select claim
+  (PROJECT_SPEC.md M8 task 3's suggested design, to avoid warp divergence)
+  is written as intended but explicitly NOT confirmed by inspecting SASS
+  or an Nsight Compute profile -- that's real M9 work, not something to
+  assume succeeded just because the C++ ternary looks branchless.
+
+**The honest bottom line:** M8 tasks 1-3 have real code, real design
+reasoning, and (for task 2's policy half only) real verification. Tasks
+1 and 3, and half of task 2, are STAGED, not DONE, until a real Colab or
+Kaggle T4 session runs `make build && make test` and the M8 bench
+scripts. The next session picking this up should treat every "M8 task 1/3
+complete" claim as provisional until that happens -- this note exists so
+that check isn't skipped just because the code already looks finished.
