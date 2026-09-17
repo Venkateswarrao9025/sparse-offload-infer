@@ -214,7 +214,7 @@ class DipBuffers:
 def run_decoder_layer_dip(
     pipeline: WeightPipeline, model: StreamingModel, layer_idx: int, x_flat: torch.Tensor, pos: int,
     k_cache: torch.Tensor, v_cache: torch.Tensor, dip_k: int, bufs: DipBuffers,
-    channel_counts: list[torch.Tensor] | None = None,
+    channel_counts: list[torch.Tensor] | None = None, selected_out: list[list] | None = None,
 ) -> torch.Tensor:
     """M7: same attention block as run_decoder_layer_streaming (q/k/v/o
     still fully dense-streamed through `pipeline`), but the MLP only
@@ -238,7 +238,14 @@ def run_decoder_layer_dip(
     are scatter-added into `channel_counts[layer_idx]` (1 per selection),
     building the per-channel selection-frequency histogram M8's calibration
     pass needs. None (the default) skips this entirely, at zero cost to
-    the M7 decode path."""
+    the M7 decode path.
+
+    selected_out (M8 task 2): optional list of `num_layers` lists -- if
+    given, this layer's selected channel indices (as a plain Python list
+    of ints, for hot_cache.py's pure-CPU trace simulation) are appended to
+    `selected_out[layer_idx]`, building the per-layer TEMPORAL trace
+    LRU/LFU-with-decay need (unlike channel_counts's aggregate-only
+    histogram, order matters here). None (the default) skips this too."""
     NQ, NKV, HD = model.num_attention_heads, model.num_key_value_heads, model.head_dim
     eps, theta = model.rms_norm_eps, model.rope_theta
     norms = model.layer_norms[layer_idx]
@@ -272,6 +279,8 @@ def run_decoder_layer_dip(
     if channel_counts is not None:
         channel_counts[layer_idx].scatter_add_(0, idx_long, torch.ones_like(idx_long))
     idx_cpu = idx_long.cpu()  # gather_rows_staged's host-side memcpy needs host-resident indices
+    if selected_out is not None:
+        selected_out[layer_idx].append(idx_cpu.tolist())  # reuses the sync above, no extra .cpu() call
 
     up_lm = model.matrices[f"model.layers.{layer_idx}.mlp.up_proj.weight"]
     up_host = model.store.matrix_view(up_lm.handle)
@@ -461,3 +470,39 @@ def calibrate_channel_frequencies(model: StreamingModel, token_ids: list[int], d
             )
 
     return channel_counts
+
+
+def calibrate_with_trace(
+    model: StreamingModel, token_ids: list[int], dip_k: int, max_seq_len: int = 512
+) -> tuple[list[torch.Tensor], list[list[list[int]]]]:
+    """M8 task 2 support: same run as calibrate_channel_frequencies, but
+    ALSO records the raw per-token, per-layer selected-channel-index
+    TRACE (not just the aggregate histogram) -- soinfer.offload.hot_cache's
+    LRU/LFU-with-decay policies need the actual temporal sequence of
+    selections to simulate against, since eviction depends on order, not
+    just total counts. A separate function rather than a flag on
+    calibrate_channel_frequencies to keep that function's simpler,
+    already-established [Tensor] return type unchanged.
+
+    Returns (channel_counts, trace) where trace[layer_idx] is a list of
+    `len(token_ids)` plain Python int lists, each dip_k long (one per
+    token, hot_cache.hot_cache._as_sorted_ints-ready)."""
+    I = model.matrices["model.layers.0.mlp.up_proj.weight"].n
+    channel_counts = [torch.zeros(I, dtype=torch.int64, device="cuda") for _ in range(model.num_layers)]
+    trace: list[list[list[int]]] = [[] for _ in range(model.num_layers)]
+
+    NKV, HD = model.num_key_value_heads, model.head_dim
+    k_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
+    v_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
+    pipeline = WeightPipeline(model, suffixes=DIP_DENSE_SUFFIXES)
+    bufs = DipBuffers.make(model, max_k=dip_k)
+
+    for pos, tok in enumerate(token_ids):
+        x = model.embed_tokens[tok].contiguous()
+        for layer_idx in range(model.num_layers):
+            x = run_decoder_layer_dip(
+                pipeline, model, layer_idx, x, pos, k_caches[layer_idx], v_caches[layer_idx], dip_k, bufs,
+                channel_counts=channel_counts, selected_out=trace,
+            )
+
+    return channel_counts, trace

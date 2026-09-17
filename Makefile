@@ -1,4 +1,4 @@
-.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline bench-m7 bench-m7-gather bench-m7-pareto bench-m8-calibration profile profile-m6-overlap clean
+.PHONY: build test bench bench-pcie bench-baseline bench-m1 bench-m2 bench-m4 bench-m6 bench-m6-headline bench-m7 bench-m7-gather bench-m7-pareto bench-m8-calibration bench-m8-hot-cache profile profile-m6-overlap clean
 
 # --no-build-isolation: link against the torch already installed in this
 # environment (e.g. Colab's preinstalled torch+cu121) instead of pip building
@@ -50,6 +50,11 @@ bench-m7-pareto:
 # and runs the M8 calibration pass. Run explicitly: `make bench-m8-calibration`.
 bench-m8-calibration:
 	python bench/bench_m8_calibration.py
+
+# Not part of `make bench` -- downloads Qwen3-1.7B if not already cached
+# and compares hot-cache policies. Run explicitly: `make bench-m8-hot-cache`.
+bench-m8-hot-cache:
+	python bench/bench_m8_hot_cache.py
 
 profile:
 	nsys profile -o reports/profile python bench/bench_pcie.py

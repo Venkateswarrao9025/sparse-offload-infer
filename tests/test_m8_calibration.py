@@ -118,3 +118,37 @@ def test_calibrate_channel_frequencies_is_deterministic():
 
     for ca, cb in zip(counts_a, counts_b):
         assert torch.equal(ca, cb)
+
+
+def test_calibrate_with_trace_matches_calibrate_channel_frequencies():
+    """calibrate_with_trace's aggregate channel_counts must agree with
+    plain calibrate_channel_frequencies on the identical input (they share
+    the same underlying loop and scatter_add_ call -- this guards against
+    the trace-capturing addition accidentally changing the aggregate
+    path), and the trace itself must reproduce those same counts when
+    tallied by hand."""
+    I = CFG["intermediate_size"]
+    dip_k = 16
+    model_a = _build_synthetic_dip_model(seed=21)
+    model_b = _build_synthetic_dip_model(seed=21)
+    token_ids = [3, 1, 4, 1, 5, 9, 2, 6]
+
+    counts_only = gen.calibrate_channel_frequencies(model_a, token_ids, dip_k)
+    counts_with_trace, trace = gen.calibrate_with_trace(model_b, token_ids, dip_k)
+
+    for c1, c2 in zip(counts_only, counts_with_trace):
+        assert torch.equal(c1, c2)
+
+    assert len(trace) == NUM_LAYERS
+    for layer_idx, layer_trace in enumerate(trace):
+        assert len(layer_trace) == len(token_ids)
+        for selected in layer_trace:
+            assert len(selected) == dip_k
+            assert len(set(selected)) == dip_k  # topk_threshold_select's set semantics: no duplicates
+            assert all(0 <= c < I for c in selected)
+
+        tallied = torch.zeros(I, dtype=torch.int64)
+        for selected in layer_trace:
+            for c in selected:
+                tallied[c] += 1
+        assert torch.equal(tallied, counts_with_trace[layer_idx].cpu())
