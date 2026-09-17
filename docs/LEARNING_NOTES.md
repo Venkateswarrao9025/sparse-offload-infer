@@ -1044,3 +1044,62 @@ Row gather from a pinned arena into a sparse GEMV's staging buffer is now
 demonstrated as the right primitive; task 3 (sparse fused GEMV restricted
 to the selected index set) is what actually turns this saved-bytes result
 into a saved-bytes-*per-token* system-level number.
+
+### 2026-09-17 -- M7 task 3: sparse fused GEMV (up reuses M4, down needs a new kernel)
+
+**The two directions are not symmetric, and seeing why was the actual
+task-3 insight -- the kernel work itself was small once that was clear.**
+For token *t*: `gate_proj` must still be computed DENSELY (all I
+channels) since selection needs `|gate_out|` for every channel before it
+can decide which ones matter. Only `up_proj` and `down_proj` become
+sparse. `up_proj` is `[I, H]`, naturally row-indexed by intermediate
+channel -- so "restrict to the selected set" is *exactly* task 2's row
+gather (already built) feeding straight into the *existing*
+`gemv_w4a16_group_lop3` (M4) with `N=k` instead of `N=I`. No new kernel
+needed; this was the first real payoff of designing task 2's primitive
+generally back in M6/task 2 rather than special-casing it.
+
+`down_proj` is different: standard nn.Linear layout is `[H, I]` (output-
+row-major), so "restrict to selected channels" means selecting *columns*,
+which are NOT contiguous in that layout -- gathering them would mean
+scattered per-element reads inside every one of H rows, not a row gather
+at all. Fix: store `down_proj` TRANSPOSED, `[I, H]`, so its rows are ALSO
+indexed by intermediate channel, and task 2's row gather works unchanged
+here too. But the compute shape flips: instead of "one row per output,
+reduce along K" (every other GEMV kernel in this repo), down's transposed
+form has no per-row output at all -- the k gathered rows collectively
+define ONE H-length output vector, `y = sum_i h[i] * W_T[i,:]`, a
+weighted row-sum. `gemv_w4a16_sparse_accumulate.cu` parallelizes by
+OUTPUT COLUMN instead of by row: thread `c` owns output column `c` and
+loops over the k selected rows, accumulating `h[i] * dequant(W_T[i,c])`.
+Consecutive threads (consecutive `c`) read the SAME packed word within an
+int4-group-of-8 for a given `i`, so this is a coalesced-broadcast read
+pattern -- the literal transpose of `gemv_w4a16_group`'s lane-strided
+pattern, matching the transposed shape of the math it computes.
+
+**Correctness: clean on the kernel itself, one real snag in the
+integration test -- and the snag taught something.** Two direct tests
+(a one-hot basis-vector exactness check, and a reference-matched check
+against `formats.dequantize`) passed on the first Colab run. A third
+test -- tying task 1's `topk_select` + both sparse GEMVs together against
+a "zero everything outside the selected set, then dense matmul" reference
+-- failed on the first run (max diff 8.0 on outputs in the thousands).
+The two kernel-level tests passing ruled out a kernel bug immediately, so
+the question was what the integration test itself was doing differently.
+Answer: floating-point addition isn't associative, and the reference
+summed all I=512 channels (masked to zero) in natural index order while
+the kernel accumulates only the k selected terms in `topk_select`'s
+UNORDERED (atomicAdd-race) gather order -- different summation order over
+~256 terms with sign cancellation, at output magnitudes in the thousands,
+produces few-ULP-scale differences after the fp16 cast on its own, with
+no bug anywhere. Fixed by selecting to the kernel's own gather order
+*before* the reference matmul too (removes the avoidable "k terms vs 512
+terms, most structurally zero" mismatch) and widening that one test's
+tolerance to reflect it's comparing two valid summation orders, not a
+kernel against a fixed-order reference of the same arithmetic. All 138
+tests pass after the fix (`make test`, full suite, not just the new file).
+
+M7 task 3 is functionally complete: both sparse GEMV paths exist and are
+verified. Byte-savings-per-token instrumentation (task 4's actual
+subject) and the k-sweep Pareto curve (perplexity vs tokens/sec) are the
+remaining M7 work.
