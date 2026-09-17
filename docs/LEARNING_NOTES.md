@@ -895,12 +895,15 @@ bracketing the loop, then parsed the `cuda_gpu_trace` CSV export
 (`bench/analyze_nsys_overlap.py`) into merged busy-intervals per stream
 and computed their intersection. Two numbers, and they tell two different
 stories:
-- **Overlap efficiency (achieved/ideal): 92.9%.** When the copy stream
-  and compute stream both have work queued, they overlap almost
-  perfectly (9.76ms of actual concurrent copy+compute out of 10.50ms
-  ideal). The double-buffering mechanism itself is not broken -- it's
-  about as good as physically possible.
-- **GPU idle 51.0% of wall-clock time** (85.1ms of 166.8ms) -- over half
+- **Overlap efficiency (achieved/ideal): 94.0%** (`reports/m6_overlap_efficiency.json`,
+  reproduced via the committed `make profile-m6-overlap` pipeline, not
+  just the interactive exploration that found it -- consistent with an
+  independent interactive run's 92.9%, run-to-run variance). When the
+  copy stream and compute stream both have work queued, they overlap
+  almost perfectly (9.88ms of actual concurrent copy+compute out of
+  10.51ms ideal). The double-buffering mechanism itself is not broken --
+  it's about as good as physically possible.
+- **GPU idle 51.4% of wall-clock time** (86.2ms of 167.8ms) -- over half
   the total time, *neither* the copy stream nor the compute stream has
   anything running at all.
 
