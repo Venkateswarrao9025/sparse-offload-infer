@@ -749,3 +749,54 @@ per-lane-read experiment already showed that widening naively trades away
 coalescing). This needs more iteration than fits in one sitting; recorded
 here as a validated, data-backed open problem rather than a guess to try
 next time.
+
+### M6 -- offload: streaming weights over PCIe (in progress)
+
+2026-09-16, later same session. Tasks 1-3 done and verified on the T4:
+`weight_store.PinnedWeightStore` (one pinned host arena, row-addressable,
+format-agnostic -- stores whatever `soinfer.quant.pack` already produced),
+`stream_manager.StreamManager` (N CUDA streams + events, `prefetch`/`wait`
+split so a transfer's async issue is separate from the GPU-side ordering
+constraint that lets it overlap compute), and the roofline benchmark
+(task 3). 10/10 new tests pass (arena addressing, overflow/duplicate-name
+rejection, row gather, and a simulated multi-layer double-buffering
+pipeline checked for buffer-reuse races); full suite 114/114.
+
+**The roofline result, and why it matters more than M4's remaining gap.**
+`bench/bench_m6_roofline.py`: for each of one Qwen3-1.7B-shaped decoder
+layer's 5 weight matrices (qkv_proj, o_proj, gate_proj, up_proj,
+down_proj), quantized to INT4-group128 and packed exactly as M4 expects,
+measured real pinned-H2D transfer time (via the new StreamManager, not a
+back-of-envelope PCIe-spec number) against the `gemv_w4a16_group_lop3`
+kernel time that consumes it. Result (`reports/m6_roofline.csv`): **one
+layer's total transfer time is 8.69x its total compute time** (2.31ms vs
+0.27ms). Per-matrix ratios range 5.5x (o_proj) to 10.2x (gate/up_proj) --
+smaller matrices have relatively more fixed transfer overhead, larger
+ones scale more predictably with bytes. This is the plot PROJECT_SPEC.md
+says "justifies the entire rest of the project," and it does: at ~9x
+transfer-bound, the actual lever for making decode faster in the offload
+regime is *reducing bytes transferred* (M7's whole premise -- only stream
+the MLP rows that matter for this token), not further kernel
+micro-optimization.
+
+That reframes M4's still-open 3x-vs-1.7x-throughput gap: even if that
+kernel were made *fully* memory-bound-efficient (some further multiple
+faster), the system would still be transfer-bound by a wide margin --
+9x would become somewhat more, not disappear. M4's gap is real and worth
+closing eventually (it's the acceptance bar M4 itself set), but this
+roofline is the first hard evidence in this project that kernel speed
+isn't actually the bottleneck for the thing the project is ultimately
+about. Good example of why M6 task 3 comes *before* the headline model in
+the spec's own ordering -- the number changes what's worth optimizing
+next.
+
+**Not yet done:** M6 task 4 (bring in the real 14B/32B headline model) is
+a much heavier resource commitment (multi-GB download, real VRAM/host-RAM
+budget on the Colab instance) than anything else this session did --
+holding off on it pending a decision with the user rather than just
+downloading a large model unprompted. Nsight Systems timeline evidence of
+*actual* overlap (not just the roofline's time comparison) is also not
+yet captured -- the roofline shows transfer *should* dominate, but doesn't
+by itself prove the double-buffering pipeline achieves good overlap
+efficiency in practice; that needs `nsys profile` on a real multi-layer
+decode loop.
