@@ -285,16 +285,26 @@ class HotCache:
         up_lm = model.matrices[f"model.layers.{layer_idx}.mlp.up_proj.weight"]
         downT_lm = model.matrices[f"model.layers.{layer_idx}.{DOWN_PROJ_T_SUFFIX}"]
 
-        up_host = model.store.matrix_view(up_lm.handle)
-        up_staging = torch.empty(C, up_lm.handle.row_nbytes, dtype=torch.uint8).pin_memory()
         up_gpu = torch.empty(C, up_lm.handle.row_nbytes, dtype=torch.uint8, device="cuda")
-        ops.gather_rows_staged(up_host, hot_indices, up_staging, up_gpu)
-
-        down_host = model.store.matrix_view(downT_lm.handle)
-        down_staging = torch.empty(C, downT_lm.handle.row_nbytes, dtype=torch.uint8).pin_memory()
         down_gpu = torch.empty(C, downT_lm.handle.row_nbytes, dtype=torch.uint8, device="cuda")
-        ops.gather_rows_staged(down_host, hot_indices, down_staging, down_gpu)
-        torch.cuda.synchronize()  # both gathers must land before the cache is considered ready
+        if C > 0:
+            # C == 0 (nothing cached, e.g. cache_size=0 or before calibration)
+            # is a legitimate config -- skip the gather entirely rather than
+            # calling gather_rows_staged with a 0-row staging buffer: a
+            # freshly-.pin_memory()'d ZERO-element CPU tensor isn't actually
+            # registered as pinned (there's nothing to page-lock), so the
+            # binding's pinned-memory check rejects it. up_gpu/down_gpu are
+            # already the correctly-shaped (0-row) empty CUDA tensors either
+            # way, matching the empty-cache-buffer convention
+            # test_m8_fused_gemv.py's degenerate all-staging tests use.
+            up_host = model.store.matrix_view(up_lm.handle)
+            up_staging = torch.empty(C, up_lm.handle.row_nbytes, dtype=torch.uint8).pin_memory()
+            ops.gather_rows_staged(up_host, hot_indices, up_staging, up_gpu)
+
+            down_host = model.store.matrix_view(downT_lm.handle)
+            down_staging = torch.empty(C, downT_lm.handle.row_nbytes, dtype=torch.uint8).pin_memory()
+            ops.gather_rows_staged(down_host, hot_indices, down_staging, down_gpu)
+            torch.cuda.synchronize()  # both gathers must land before the cache is considered ready
 
         up_scale = up_lm.scale.index_select(0, hot_indices_cuda)
         down_scale = downT_lm.scale.index_select(0, hot_indices_cuda)

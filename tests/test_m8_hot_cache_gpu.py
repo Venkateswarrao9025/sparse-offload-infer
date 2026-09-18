@@ -120,6 +120,21 @@ def test_hot_cache_build_slot_of_matches_hot_indices():
         assert int(slot_of[c].item()) == expected_slot.get(c, -1)
 
 
+def test_hot_cache_build_with_empty_hot_set():
+    """Regression: C=0 (nothing cached, e.g. cache_size=0 or before a
+    calibration pass has run) used to crash HotCache.build --
+    gather_rows_staged rejected a freshly-.pin_memory()'d ZERO-element CPU
+    tensor as 'not pinned' (nothing to page-lock for an empty allocation).
+    Found by test_m8_cached_dip_pipeline.py's cache_frac=0.0 case."""
+    model, _raw = _build_synthetic_model_with_raw_weights(seed=4)
+    I = CFG["intermediate_size"]
+    cache = hot_cache.HotCache.build(model, layer_idx=0, hot_indices=[])
+    assert cache.cache_size == 0
+    assert cache.up_Wq.shape[0] == 0
+    assert cache.down_Wq.shape[0] == 0
+    assert torch.all(cache.slot_of == -1)
+
+
 def test_hot_cache_build_gathers_correct_quantized_bytes_and_scales():
     """The real correctness question: does HotCache.build's gather_rows_staged
     round-trip actually pull out the SAME bytes/scales that a direct
