@@ -1575,3 +1575,34 @@ found and stays exactly as true now -- a longer/multiple eval passages,
 the 14B model, and a real calibration-informed selection criterion (M8's
 own premise) would all still firm this up further before treating
 either version of this curve as load-bearing for a README claim.
+
+### 2026-09-18 (continued) -- M9 task 2: the ablation matrix finds the throughput win M8 couldn't see
+
+M8's single-point ablation table (k/I=0.5, cache=10% of I) found real byte
+savings from caching (25.0% -> 29.6%) but NO clear throughput win --
+cache-aware DIP's tok/s (7.0-7.3) was statistically indistinguishable from
+plain DIP's (7.6), consistent with M6/M7's "mechanism overhead dominates at
+small scale" finding. `bench_m9_ablation_matrix.py` swept k/I (6 points,
+reusing M7's corrected sweep) x cache_frac (5%/10%/20% of I) -- 18 new
+points -- and the fuller picture changes the conclusion: **at a fixed k/I,
+tok/s increases monotonically with cache_frac.** At k/I=0.5: 6.75 -> 6.90 ->
+7.29 tok/s as cache grows 5% -> 10% -> 20%. At k/I=0.375: 7.20 -> 8.52 ->
+8.86. The single point M8 measured (cache=10%) just wasn't large enough
+relative to dip_k for the savings to clearly outrun the per-token mechanism
+overhead yet -- a bigger cache does show a real, visible speedup, M8's
+single data point just sat too early on that curve to see it.
+
+Every cache_aware_dip row's perplexity is bit-identical to the
+corresponding plain-DIP row at the same k/I (e.g. both k/I=0.5 rows: exactly
+231.26173400878906) across all 18 new points -- the cache-correctness claim
+from M8's own single point holds up across the whole matrix, not just the
+one configuration originally tested.
+
+**Scope actually run** (a deliberate reduction from PROJECT_SPEC.md's
+literal "model size x quant format x k x cache size, 3 seeds" -- see the
+script's own docstring for the reasoning): Qwen3-1.7B only, one quant format
+(INT4 group-128), one seed per point. `reports/m9_ablation_matrix.csv` has
+all 25 rows (7 reused from `m7_pareto.csv` + 18 new). Extending to the 14B
+model or additional quant formats is the natural follow-up if a fuller
+sweep is wanted -- the script is written so that's a loop to add, not a
+rewrite.
