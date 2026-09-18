@@ -1318,3 +1318,93 @@ Kaggle T4 session runs `make build && make test` and the M8 bench
 scripts. The next session picking this up should treat every "M8 task 1/3
 complete" claim as provisional until that happens -- this note exists so
 that check isn't skipped just because the code already looks finished.
+
+### 2026-09-18 -- M8 tasks 1-3 actually verified on a T4 -- and it immediately found THREE real bugs, none of them in the numerics this entry worried about
+
+Got a real T4 session (Colab). Every "STAGED, not DONE" item from the
+entry above ran for real: `make build` (compiled `gemv_dip_fused.cu`
+clean), `make test` (all 171-then-172 tests), `bench_m8_calibration.py`
+and `bench_m8_hot_cache.py` on real Qwen3-1.7B. Worth recording precisely
+because none of the three real bugs found were where the previous entry's
+worry was pointed (`gemv_dip_fused.cu`'s pointer-resolution numerics, the
+thing flagged as the biggest unverified risk) -- they were in test
+scaffolding, a kernel's tie-breaking, and a CPU-only policy simulation.
+"The part I was worried about was fine; the parts I wasn't were broken"
+is exactly why "reasoned through carefully" never gets to substitute for
+"ran for real," at every level of the stack, not just the scariest one.
+
+1. **Test fixture bug, not a kernel bug**: `test_m8_fused_gemv.py`'s
+   `_build_descriptors` helper did `pos | (1 << 31)` to set a sentinel
+   bit, which is a fine bit-trick in the kernel's own C++ (wraps to
+   two's-complement) but overflows a plain Python int assigned into a
+   CPU `int32` tensor (`>= 2**31` is out of signed int32 range). One-line
+   fix: `(pos | (1 << 31)) - (1 << 32)`. `gemv_dip_fused_up/_down`
+   themselves were never the problem -- 12/12 passed immediately once the
+   test could actually run.
+
+2. **Real cuBLAS non-determinism, exposed by top-k boundary sensitivity**:
+   `test_calibrate_channel_frequencies_is_deterministic` passed reliably
+   alone, failed intermittently (a DIFFERENT wrong histogram each time)
+   as part of the full suite. cuBLAS's default algorithm selection isn't
+   bit-deterministic and depends on allocator fragmentation state left by
+   whichever tests ran earlier in the same process -- occasionally
+   flipping which channel wins a near-tied top-k boundary by a ULP.
+   Fixed at the test-infra level: `tests/conftest.py` now forces
+   `torch.use_deterministic_algorithms(True)` + `CUBLAS_WORKSPACE_CONFIG`
+   for the whole session (must be set before any CUDA/cuBLAS call, hence
+   conftest.py and not the test file itself).
+
+3. **A real kernel bug this surfaced**: `topk_select.cu`'s Phase 3 (M7's
+   single-block bisection top-k) compacted every index clearing the
+   converged threshold via atomicAdd-assigned output slots, keeping
+   "whichever k claim a slot first" when more than k elements tied
+   exactly at the threshold. The header even documented this as an
+   accepted approximation for the "measure-zero-tie case real
+   (continuous) activations present" -- true for M7's own tests (random
+   continuous floats essentially never tie exactly), false for M8's
+   calibration pass, which runs this on DEQUANTIZED activations, where
+   exact float ties across channels are common. Whichever tied channels
+   won was determined by GPU thread-scheduling order -- not fixed by the
+   determinism flags above, since this is a hand-written kernel, not a
+   cuBLAS call. Fix: gather everything strictly above tau first (order
+   among these is harmless), then fill any remaining slots from
+   tau-tied indices by ascending index instead of atomic race order.
+
+4. **A fourth bug, found by eyeballing benchmark output rather than a
+   failing test**: `bench_m8_hot_cache.py`'s real run showed `LRUPolicy`
+   at EXACTLY 0.0% hit rate at every cache size tested (1%-20% of I),
+   while static and LFU-with-decay both showed sensible non-zero rates on
+   the identical trace -- too clean to be a real result, and it was
+   wrong. `LRUPolicy.simulate` checked cache membership and mutated the
+   cache (evict-then-insert) for one channel at a time, in the SAME pass,
+   walking a token's selected channels in sorted-index order. All 16
+   "genuinely verified, no GPU needed" CPU tests from the entry above
+   used ONE-channel-per-token traces, so a token's own selection count
+   never approached cache_size and this never mattered. Real M8 traffic
+   selects `dip_k` channels PER TOKEN (3072 at k/I=0.5) against cache
+   sizes of a few hundred -- a token's OWN selections alone exceed
+   cache_size 2-3x over, so the token's own churn evicts anything carried
+   over from the previous token before cross-token reuse is ever checked.
+   Confirmed with a minimal synthetic repro (20 persistently-hot channels
+   out of 100, dip_k=40, cache_size=10) before touching the fix: LRU got
+   exactly 0/7234 hits while LFU got 1291 and static got 498 on the
+   IDENTICAL trace. Fixed by splitting each token into two phases: check
+   ALL of this token's selections against the cache as it stood at the
+   end of the previous token first (tallying hits), then insert misses
+   once, after every hit is counted -- matching how the real per-token
+   GPU `HotCache` actually resolves a token's channels. LFU's eviction
+   (global accumulated frequency, not local recency) was never
+   susceptible to this and needed no change. This is the one of the four
+   that no test suite would have caught on its own -- it took looking at
+   real numbers and noticing "exactly zero" doesn't look like a genuine
+   result.
+
+**Current verified state**: 172/172 tests pass, confirmed across 5
+repeated full-suite runs (no flakiness). `gemv_dip_fused.cu` (task 3's
+centerpiece kernel) is genuinely hardware-verified. Task 1's calibration
+produced real skew data on Qwen3-1.7B (top 25% of channels account for
+~44-47% of selections at k/I=0.5, against 25% for uniform-random
+selection). Task 2's `HotCache` GPU-resident half is still unverified
+(the benchmark exercises only the policy-simulation half against a real
+trace, not the GPU cache class itself). Task 4 (the ablation table) is
+still not started.
