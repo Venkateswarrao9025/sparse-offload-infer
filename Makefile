@@ -63,6 +63,12 @@ bench-m8-hot-cache:
 bench-m8-ablation:
 	python bench/bench_m8_ablation.py
 
+# Not part of `make bench` -- downloads Qwen3-1.7B if not already cached
+# and needs reports/m7_pareto.csv already present (make bench-m7-pareto).
+# M9 task 2's ablation matrix (lean scope, see the script's own docstring).
+bench-m9-ablation-matrix:
+	python bench/bench_m9_ablation_matrix.py
+
 profile:
 	nsys profile -o reports/profile python bench/bench_pcie.py
 
