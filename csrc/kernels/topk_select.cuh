@@ -11,14 +11,17 @@
 //   selection must cost less than the transfer it saves, and a
 //   host-driven per-iteration launch loop would blow the microsecond
 //   budget on launch overhead alone) for a threshold tau such that
-//   count(|g| >= tau) >= k, then compacts every index clearing that
-//   threshold into out_indices (via atomicAdd-assigned output slots --
-//   the OUTPUT ORDER is unspecified, which is fine: row gather only needs
-//   the index SET, not an ordering). If more than k elements tie exactly
-//   at the converged threshold, the first k (by atomicAdd race order) are
-//   kept and the rest discarded -- a documented, accepted approximation
-//   for the measure-zero-tie case real (continuous) activations present.
-//   Single block: uses one SM, not the whole GPU -- simplicity/
+//   count(|g| >= tau) >= k, then compacts into out_indices: every index
+//   STRICTLY above tau first (via atomicAdd-assigned output slots -- the
+//   OUTPUT ORDER among these is unspecified, which is fine: row gather
+//   only needs the index SET, not an ordering), then any remaining slots
+//   filled from indices tied exactly AT tau, by ascending index. The tie
+//   handling is NOT measure-zero here (M8's calibration pass runs this on
+//   dequantized activations, where exact float ties across channels are
+//   common, unlike continuous floats) -- earlier atomicAdd-order tie
+//   resolution made the returned SET depend on GPU thread-scheduling
+//   order; ascending-index tie-break makes it a pure function of the
+//   input again. Single block: uses one SM, not the whole GPU -- simplicity/
 //   correctness-first, matching this project's v1-then-optimize pattern
 //   (a grid-wide multi-block version is the natural follow-up once this
 //   is verified).

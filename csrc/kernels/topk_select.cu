@@ -61,16 +61,17 @@ __global__ void topk_threshold_select_kernel(const float* __restrict__ vals, int
         __syncthreads();
     }
 
-    // Phase 3: compact every index clearing the converged threshold.
-    // atomicAdd-assigned output slots -- unordered, which is fine (see
-    // topk_select.cuh's header comment).
+    // Phase 3: gather every index STRICTLY above tau first -- these are
+    // unambiguously in the top-k regardless of output slot, since nothing
+    // at the boundary can displace them, so atomicAdd race order among
+    // them is harmless (see topk_select.cuh's header comment).
     if (tid == 0) {
         s_counter = 0;
     }
     __syncthreads();
     const float tau = s_lo;
     for (int i = tid; i < n; i += blockDim.x) {
-        if (vals[i] >= tau) {
+        if (vals[i] > tau) {
             const int pos = atomicAdd(&s_counter, 1);
             if (pos < k) {
                 out_indices[pos] = i;
@@ -78,8 +79,28 @@ __global__ void topk_threshold_select_kernel(const float* __restrict__ vals, int
         }
     }
     __syncthreads();
+    // Any remaining slots come from indices tied exactly AT tau. Ties are
+    // NOT measure-zero here: |gate| comes from dequantized activations, so
+    // exact float equality across channels is common (unlike the
+    // continuous-float assumption this kernel started with). Filling them
+    // by atomicAdd race order made the returned SET depend on GPU thread
+    // scheduling -- invisible on M7's original continuous-activation
+    // tests, but non-deterministic once M8's calibration pass fed it real
+    // quantized data. Fill by ascending index instead: single-threaded and
+    // O(n), but only runs the `remaining` iterations that matter and ties
+    // are the rare case, so this doesn't reopen the >1 SM performance
+    // question this kernel already has open.
     if (tid == 0) {
-        *out_count = min(s_counter, k);
+        const int base = min(s_counter, k);
+        int remaining = k - base;
+        int filled = 0;
+        for (int i = 0; i < n && filled < remaining; ++i) {
+            if (vals[i] == tau) {
+                out_indices[base + filled] = i;
+                ++filled;
+            }
+        }
+        *out_count = base + filled;
     }
 }
 
