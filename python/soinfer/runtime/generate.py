@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 import soinfer.ops as ops
+from soinfer.offload.hot_cache import HotCache
 from soinfer.offload.load_hf_checkpoint import DOWN_PROJ_T_SUFFIX, LINEAR_SUFFIXES, LoadedMatrix
 from soinfer.offload.stream_manager import StreamManager
 from soinfer.offload.weight_store import PinnedWeightStore
@@ -309,6 +310,100 @@ def run_decoder_layer_dip(
     return residual2 + down_out
 
 
+def run_decoder_layer_cached_dip(
+    pipeline: WeightPipeline, model: StreamingModel, layer_idx: int, x_flat: torch.Tensor, pos: int,
+    k_cache: torch.Tensor, v_cache: torch.Tensor, dip_k: int, bufs: DipBuffers, caches: list[HotCache],
+    miss_bytes: list[int] | None = None,
+) -> torch.Tensor:
+    """M8 task 3/4: same block as run_decoder_layer_dip, but up_proj/
+    down_proj_T rows are resolved through `caches[layer_idx]` (a HotCache
+    built ONCE before generation starts, M8 task 2) instead of gathering
+    all dip_k rows from the host arena every token. ops.build_dip_descriptors
+    (M8 task 3) splits this token's dip_k selected channels into cache
+    hits (zero-cost: already GPU-resident) and staging misses (gathered
+    via gather_rows_staged, exactly like run_decoder_layer_dip does for
+    ALL dip_k channels -- here only for the ones NOT cached); the two
+    fused GEMVs (ops.gemv_dip_fused_up/_down) read both sources in a
+    single kernel launch each, no host-side branch between them.
+
+    caches: one HotCache per layer, built by the caller before decoding
+    starts (typically from StaticFrequencyPolicy.hot_set on a prior
+    calibration pass -- see bench/bench_m8_ablation.py).
+
+    miss_bytes (M8 task 4's "instrument it directly, don't infer from hit
+    rate" acceptance bar): optional single-layer-per-index list -- if
+    given, this call's ACTUAL transferred bytes (miss_count rows' worth,
+    up + down) are added to miss_bytes[layer_idx]. Unlike M7's
+    dip_bytes_per_token (a pure function of dip_k alone), cache-aware
+    bytes/token is data-dependent -- which channels miss depends on this
+    token's actual selection vs. the fixed cache -- so it can only be
+    measured from a real run, not computed in closed form."""
+    NQ, NKV, HD = model.num_attention_heads, model.num_key_value_heads, model.head_dim
+    eps, theta = model.rms_norm_eps, model.rope_theta
+    norms = model.layer_norms[layer_idx]
+
+    residual = x_flat
+    h = ops.rmsnorm(x_flat.unsqueeze(0), norms["input_layernorm"], eps).squeeze(0).contiguous()
+
+    q = pipeline.next_gemv(h).view(NQ, HD).contiguous()
+    k = pipeline.next_gemv(h).view(NKV, HD).contiguous()
+    v = pipeline.next_gemv(h).view(NKV, HD).contiguous()
+
+    q = ops.qk_norm(q, norms["q_norm"], eps)
+    k = ops.qk_norm(k, norms["k_norm"], eps)
+    cos_vals, sin_vals = ops.precompute_rope_cos_sin(HD, theta, pos, device="cuda")
+    q = ops.apply_rope(q, cos_vals, sin_vals)
+    k = ops.apply_rope(k, cos_vals, sin_vals)
+
+    ops.kv_cache_append(k_cache, v_cache, k, v, pos)
+    attn_out = ops.decode_attention(q, k_cache, v_cache, pos + 1).reshape(NQ * HD).contiguous()
+
+    o = pipeline.next_gemv(attn_out)
+    h2 = residual + o
+
+    residual2 = h2
+    h3 = ops.rmsnorm(h2.unsqueeze(0), norms["post_attention_layernorm"], eps).squeeze(0).contiguous()
+
+    gate = pipeline.next_gemv(h3)  # dense: |gate_out| drives selection below
+    abs_g = gate.float().abs().contiguous()
+    idx = ops.topk_threshold_select(abs_g, dip_k)  # [dip_k] int32, CUDA
+    idx_long = idx.long()
+
+    cache = caches[layer_idx]
+    up_lm = model.matrices[f"model.layers.{layer_idx}.mlp.up_proj.weight"]
+    downT_lm = model.matrices[f"model.layers.{layer_idx}.{DOWN_PROJ_T_SUFFIX}"]
+    descriptors, miss_channels, miss_count = ops.build_dip_descriptors(idx, cache.slot_of)
+    mc = int(miss_count.item())  # data-dependent sync, same cost shape as M7's idx_cpu sync above
+    miss_idx_cpu = miss_channels[:mc].cpu().long()
+
+    up_nbytes = mc * bufs.up_row_nbytes
+    up_staging = bufs.staging_up[:up_nbytes].view(mc, bufs.up_row_nbytes)
+    up_gpu = bufs.gpu_up[:up_nbytes].view(mc, bufs.up_row_nbytes)
+    ops.gather_rows_staged(model.store.matrix_view(up_lm.handle), miss_idx_cpu, up_staging, up_gpu)
+
+    down_nbytes = mc * bufs.down_row_nbytes
+    down_staging = bufs.staging_down[:down_nbytes].view(mc, bufs.down_row_nbytes)
+    down_gpu = bufs.gpu_down[:down_nbytes].view(mc, bufs.down_row_nbytes)
+    ops.gather_rows_staged(model.store.matrix_view(downT_lm.handle), miss_idx_cpu, down_staging, down_gpu)
+    torch.cuda.synchronize()  # both gathers must land before the fused GEMVs below read them
+
+    if miss_bytes is not None:
+        miss_bytes[layer_idx] += mc * (bufs.up_row_nbytes + bufs.down_row_nbytes)
+
+    up_staging_scale = up_lm.scale.index_select(0, miss_channels[:mc].long())
+    u_selected = ops.gemv_dip_fused_up(cache.up_Wq, cache.up_scale, up_gpu, up_staging_scale, descriptors, h3,
+                                        up_lm.packed_k, model.group_size)
+
+    g_selected = gate.index_select(0, idx_long)
+    h_selected = (F.silu(g_selected.float()) * u_selected.float()).half()
+
+    down_staging_scale = downT_lm.scale.index_select(0, miss_channels[:mc].long())
+    down_out = ops.gemv_dip_fused_down(cache.down_Wq, cache.down_scale, down_gpu, down_staging_scale, descriptors,
+                                        h_selected, model.hidden_size, model.group_size)
+
+    return residual2 + down_out
+
+
 def dip_bytes_per_token(model: StreamingModel, dip_k: int, dense: bool = False) -> int:
     """M7 acceptance ("measurable reduction in bytes transferred per token
     -- instrument it directly, count bytes, don't infer from timing"):
@@ -400,6 +495,48 @@ def generate_dip(model: StreamingModel, prompt_ids: list[int], n_new: int, dip_k
         x = model.embed_tokens[next_tok].contiguous()
         for layer_idx in range(model.num_layers):
             x = run_decoder_layer_dip(pipeline, model, layer_idx, x, pos, k_caches[layer_idx], v_caches[layer_idx], dip_k, bufs)
+        pos += 1
+
+    return all_tokens
+
+
+def generate_cached_dip(model: StreamingModel, prompt_ids: list[int], n_new: int, dip_k: int,
+                         caches: list[HotCache], eos_token_id: int | None = None, max_seq_len: int = 512,
+                         miss_bytes: list[int] | None = None) -> list[int]:
+    """M8 task 4: same greedy-decode structure as generate_dip, but every
+    layer's MLP runs run_decoder_layer_cached_dip instead of
+    run_decoder_layer_dip -- up_proj/down_proj_T rows for cache-resident
+    channels cost zero transfer, only the staging misses are gathered.
+    `caches` (one HotCache per layer) must already be built by the caller
+    -- building a HotCache is a one-time cost meant to be paid once before
+    decoding starts (M8's whole premise), not repeated per generate_cached_dip
+    call the way a fresh WeightPipeline/DipBuffers naturally is here."""
+    NKV, HD = model.num_key_value_heads, model.head_dim
+    k_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
+    v_caches = [torch.zeros(NKV, max_seq_len, HD, device="cuda", dtype=torch.float16) for _ in range(model.num_layers)]
+    pipeline = WeightPipeline(model, suffixes=DIP_DENSE_SUFFIXES)
+    bufs = DipBuffers.make(model, max_k=dip_k)
+
+    all_tokens = list(prompt_ids)
+    x = None
+    for pos, tok in enumerate(prompt_ids):
+        x = model.embed_tokens[tok].contiguous()
+        for layer_idx in range(model.num_layers):
+            x = run_decoder_layer_cached_dip(pipeline, model, layer_idx, x, pos, k_caches[layer_idx],
+                                              v_caches[layer_idx], dip_k, bufs, caches, miss_bytes)
+
+    pos = len(prompt_ids)
+    for _ in range(n_new):
+        xn = ops.rmsnorm(x.unsqueeze(0), model.final_norm, model.rms_norm_eps).squeeze(0).contiguous()
+        logits = ops.gemv_fp16_v3(model.lm_head, xn)
+        next_tok = int(torch.argmax(logits).item())
+        all_tokens.append(next_tok)
+        if eos_token_id is not None and next_tok == eos_token_id:
+            break
+        x = model.embed_tokens[next_tok].contiguous()
+        for layer_idx in range(model.num_layers):
+            x = run_decoder_layer_cached_dip(pipeline, model, layer_idx, x, pos, k_caches[layer_idx],
+                                              v_caches[layer_idx], dip_k, bufs, caches, miss_bytes)
         pos += 1
 
     return all_tokens
