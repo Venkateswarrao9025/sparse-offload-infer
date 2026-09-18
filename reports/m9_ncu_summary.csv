@@ -1,0 +1,12 @@
+kernel,achieved_occupancy_pct,theoretical_occupancy_pct,memory_throughput_pct,compute_sm_throughput_pct,registers_per_thread,grid_size,block_size,duration_ns
+rmsnorm_kernel,24.81,100,0.62,0.20,16,1,256,17120
+gemv_w4a16_group_lop3_kernel,89.55,100,53.34,72.17,38,1280,128,135904
+rope_apply_kernel,6.25,100,1.75,1.09,16,40,64,4544
+kv_cache_append_kernel,12.42,100,1.03,0.38,20,8,128,3936
+decode_attention_kernel,12.51,100,3.57,5.73,27,40,128,5920
+topk_threshold_select_kernel,8.22,100,0.13,0.13,18,1,1024,3698752
+gemv_w4a16_sparse_accumulate_kernel,24.94,100,18.52,28.75,43,20,256,1936096
+build_dip_descriptors_kernel,23.90,100,10.03,4.36,16,34,256,5536
+gemv_dip_fused_up_kernel,92.91,100,54.22,75.97,40,2176,128,220736
+gemv_dip_fused_down_kernel,25.01,100,10.74,18.97,30,20,256,4436544
+gemv_v3_kernel,12.40,100,29.65,6.27,35,25,128,12832
