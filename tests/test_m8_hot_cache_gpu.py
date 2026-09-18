@@ -134,8 +134,9 @@ def test_hot_cache_build_gathers_correct_quantized_bytes_and_scales():
 
     # Independent ground truth: re-quantize the RAW weight (not read back
     # through the store at all) and index_select the same rows.
-    up_Wq_full, up_scale_full, up_qt = _quantize_and_pack(raw["up_W"])
-    down_Wq_full, down_scale_full, down_qt = _quantize_and_pack(raw["downT_W"])
+    up_Wq_full, up_scale_full, _ = _quantize_and_pack(raw["up_W"])
+    down_Wq_full, down_scale_full, _ = _quantize_and_pack(raw["downT_W"])
+    up_qt = formats.quantize(raw["up_W"].float(), formats.QuantConfig(bits=4, granularity="group", group_size=GROUP_SIZE))
     idx = torch.tensor(hot_indices, dtype=torch.int64)
 
     assert torch.equal(cache.up_Wq.cpu(), up_Wq_full.index_select(0, idx))
@@ -184,7 +185,7 @@ def test_hot_cache_feeds_real_fused_gemv_pipeline_matches_m7_dense_reference():
     # via DipBuffers -- not an index_select shortcut.
     descriptors, miss_channels, miss_count = soinfer.ops.build_dip_descriptors(selected, cache.slot_of)
     mc = int(miss_count.item())
-    miss_idx_cpu = miss_channels[:mc].cpu()
+    miss_idx_cpu = miss_channels[:mc].cpu().long()  # gather_rows_staged needs a 1D int64 CPU tensor
 
     up_staging = torch.empty(mc, up_lm.handle.row_nbytes, dtype=torch.uint8).pin_memory()
     up_staging_gpu = torch.empty(mc, up_lm.handle.row_nbytes, dtype=torch.uint8, device="cuda")
