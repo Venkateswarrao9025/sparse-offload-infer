@@ -1195,6 +1195,12 @@ WHAT, at WHAT scale, under WHAT load -- not just verified.
 
 ### 2026-09-17 -- M7 task 4: the k-sweep Pareto curve, and where the knee actually is
 
+**CORRECTED 2026-09-18 -- the table below was measured on a nondeterministic
+kernel and is superseded. See "M8 task 4: a FIFTH bug" and "M7 Pareto curve
+re-run with the fix" further down for the corrected numbers and what
+changed. Left as-written below for the record, not because it's still
+trusted.**
+
 With the race fixed, `bench/bench_m7_pareto.py` on real Qwen3-1.7B gives a
 sensible result on the first re-run (`reports/m7_pareto.csv`, teacher-forced
 perplexity over a 70-token real passage, dense's own already-verified
@@ -1514,3 +1520,58 @@ honest result, not a headline one: the byte-savings thesis is proven:
 the throughput thesis needs a bigger cache fraction, a bigger model, or
 both to actually show up in tok/s -- the natural next question for M9's
 fuller ablation matrix.
+
+### 2026-09-18 (continued) -- M7 Pareto curve re-run with the fix: the cliff moved
+
+The fifth bug above (`topk_threshold_select`'s output ORDER, not just its
+SET, was non-deterministic) was found building M8's ablation table --
+but `bench_m7_pareto.py`'s original run (the entry above, "the knee is
+sharp... between k/I=0.375 and k/I=0.25") used the SAME buggy kernel.
+Re-ran it after the fix, same model/passage/k-sweep, reproduced
+bit-identical across two independent full runs:
+
+| k/I | bytes/token saved | tokens/sec | perplexity | ratio vs dense | old ratio (buggy kernel) |
+|---|---|---|---|---|---|
+| 1.0 (dense) | 0% | 12.10 | 16.50 | 1.00x | 1.00x |
+| 1.0 (DIP) | 0% | 5.58 | 16.88 | 1.02x | 1.02x |
+| 0.75 | 12.5% | 6.46 | 57.75 | 3.50x | 3.65x |
+| 0.5 | 25.0% | 7.70 | 231.26 | 14.01x | 15.26x |
+| 0.375 | 31.2% | 8.29 | 695.75 | 42.16x | 31.92x |
+| 0.25 | 37.5% | 9.10 | 4969.78 | 301.13x | 15721x |
+| 0.125 | 43.8% | 9.54 | 365166.03 | 22126x | 67723x |
+
+**The story changes, not just the digits.** The old data's headline
+finding -- "sharp cliff, not gradual, between 0.375 and 0.25" -- doesn't
+survive. k/I=0.25 is still bad (301x) but nowhere near the old 15721x
+(actually roughly 50x LESS catastrophic than reported), while k/I=0.375
+is now WORSE relative to 0.5 than before (42.2x vs 14.0x, a 3x jump,
+versus the old data's 15.3x vs 31.9x, a ~2x jump) -- if anything the
+"knee" sits closer to k/I=0.5 alone now, with 0.375 already deep into
+clearly-bad territory rather than "smooth and tolerable." k/I=1.0 and
+0.75 barely moved (1.02x/3.50x vs 1.02x/3.65x) -- consistent with the
+root cause: at high k, most channels are unambiguously "in," so few
+indices ever sit exactly at the atomicAdd-raced boundary majority's
+reordering has less to disturb; at low k, a much larger fraction of the
+selected set's summation order is up for grabs each run, so the error
+compounds harder. This is itself informative about WHERE the bug's
+impact concentrated, not just that a bug existed.
+
+**Why this matters beyond "the numbers changed":** the OLD table was
+generated, written up, and had a confident narrative ("cliff," "knee at
+k/I≈0.375-0.5") built on top of it -- entirely plausibly, from a single
+nondeterministic run that could just as easily have come out looking
+smoother. Every one of this project's "verified on hardware" claims
+carries the same risk until PROVEN otherwise: a number from ONE run,
+however real the hardware, is not the same claim as a number confirmed
+REPRODUCIBLE across runs. `reports/m7_pareto.csv` is now the corrected,
+reproduced-twice version; the entry above is left in place, annotated,
+rather than silently rewritten, because the CORRECTION is itself part of
+the record this project is trying to keep honest.
+
+**Still an open caveat, unchanged by this fix:** ONE model (1.7B), ONE
+70-token passage, top-k-by-raw-gate-magnitude as the only selection
+criterion tried. That caveat was already flagged before this bug was
+found and stays exactly as true now -- a longer/multiple eval passages,
+the 14B model, and a real calibration-informed selection criterion (M8's
+own premise) would all still firm this up further before treating
+either version of this curve as load-bearing for a README claim.
