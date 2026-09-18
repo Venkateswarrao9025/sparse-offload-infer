@@ -98,7 +98,22 @@ class StaticFrequencyPolicy:
 class LRUPolicy:
     """M8 task 2: evicts the least-recently-selected channel on a miss
     when the cache is full. Fully online/adaptive -- needs no calibration
-    pass at all, unlike StaticFrequencyPolicy."""
+    pass at all, unlike StaticFrequencyPolicy.
+
+    Each token's selected set is checked against the cache's state as of
+    the END of the PREVIOUS token, all at once, before any of THIS token's
+    own misses are inserted -- matching how the real per-token GPU
+    HotCache actually works (build_dip_descriptors resolves every one of a
+    token's dip_k channels against the cache's current state, then the
+    cache updates once for the next token). Checking and mutating one
+    channel at a time within a single token (an earlier version of this
+    method did) breaks down whenever a token's own selection count
+    exceeds cache_size -- real M8 traffic always does (dip_k=3072 vs.
+    cache sizes of a few hundred): the token's OWN churn evicts everything
+    carried over from the previous token before cross-token reuse is ever
+    checked, silently producing a ~0% hit rate regardless of how skewed
+    the real access pattern is. Caught by bench_m8_hot_cache.py on real
+    Qwen3-1.7B data -- see docs/LEARNING_NOTES.md's M8 entry."""
 
     name = "lru"
 
@@ -109,16 +124,20 @@ class LRUPolicy:
         cache: "OrderedDict[int, None]" = OrderedDict()
         hits = total = 0
         for selected in trace:
-            for c in _as_sorted_ints(selected):
-                total += 1
+            indices = _as_sorted_ints(selected)
+            total += len(indices)
+            misses = []
+            for c in indices:
                 if c in cache:
                     hits += 1
                     cache.move_to_end(c)
                 else:
-                    if self.cache_size > 0 and len(cache) >= self.cache_size:
-                        cache.popitem(last=False)  # evict least-recently-used
-                    if self.cache_size > 0:
-                        cache[c] = None
+                    misses.append(c)
+            for c in misses:
+                if self.cache_size > 0 and len(cache) >= self.cache_size:
+                    cache.popitem(last=False)  # evict least-recently-used
+                if self.cache_size > 0:
+                    cache[c] = None
         return SimulationResult(self.name, self.cache_size, hits, total)
 
 

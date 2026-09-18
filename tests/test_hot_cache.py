@@ -64,6 +64,27 @@ def test_lru_full_coverage_cache_eventually_all_hits_after_first_pass():
     assert result.total == 9
 
 
+def test_lru_hits_survive_a_per_token_selection_set_larger_than_cache():
+    """Regression: real M8 traffic selects dip_k channels PER TOKEN
+    (thousands), far more than any realistic cache_size -- a token's own
+    selection count exceeding cache_size, not just the trace overall. An
+    earlier version of LRUPolicy.simulate checked-and-evicted one channel
+    at a time WITHIN a token, so a token's own churn wiped out everything
+    carried over from the previous token before cross-token reuse was ever
+    checked -- silently producing ~0% hit rate on real hardware regardless
+    of skew (see bench_m8_hot_cache.py's Qwen3-1.7B run,
+    docs/LEARNING_NOTES.md's M8 entry). cache_size=2 here, but each token
+    selects 3 channels (> cache_size), the same shape of mismatch.
+    """
+    # tok0 [0,1,2]: cache starts empty, all 3 miss; cache ends at {1,2}
+    #   (0 evicted immediately by 2, since the batch itself exceeds cache_size).
+    # tok1 [1,3]: 1 must still be a HIT -- it was cached at the END of tok0,
+    #   before any of tok1's own insertions had a chance to evict it.
+    result = hot_cache.LRUPolicy(cache_size=2).simulate([[0, 1, 2], [1, 3]])
+    assert result.hits == 1
+    assert result.total == 5
+
+
 # ---------------------------------------------------------------------------
 # LFUDecayPolicy
 # ---------------------------------------------------------------------------
