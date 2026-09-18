@@ -1408,3 +1408,109 @@ selection). Task 2's `HotCache` GPU-resident half is still unverified
 (the benchmark exercises only the policy-simulation half against a real
 trace, not the GPU cache class itself). Task 4 (the ablation table) is
 still not started.
+
+### 2026-09-18 (continued) -- M8 task 4: a FIFTH bug, deeper than the fourth -- same SET, different ORDER, different perplexity
+
+Closing out M8: verified `HotCache` (the GPU-resident half the entry
+above left unverified), wired it into a real cache-aware decode loop
+(`run_decoder_layer_cached_dip`/`generate_cached_dip`, new), and built
+the ablation table PROJECT_SPEC.md calls "the single most important
+artifact in the repo." Found a bug worse than any of the day's first
+four, because of what it called into question: not just M8's new code,
+but M7's own already-reported, already-"verified" knee result.
+
+**What happened:** building the ablation table, the DIP row's perplexity
+differed depending on run order relative to the cache-aware-DIP row --
+suspicious, since unit tests had already proven cache-vs-stream
+arithmetic bit-identical for a given selected channel set. Isolated it
+with `run_decoder_layer_dip` alone, no caching involved at all: two
+back-to-back calls on the IDENTICAL model, tokens, and pipeline
+construction gave DIFFERENT perplexity (247.4 vs 237.7 on one check).
+`topk_threshold_select` on a completely FROZEN input tensor, called
+twice, gave a different result. The dense GEMV kernel, checked the same
+way, did not -- ruling out everything upstream of top-k selection.
+
+**Root cause:** `topk_threshold_select`'s SELECTED SET was always
+correct and deterministic (symmetric difference zero across 10 repeated
+calls, confirmed empirically) -- but the ORDER of indices within the
+returned array was not. Phase 3 (the kernel this project fixed earlier
+THIS SAME DAY, see the tie-break entry above) still compacted the
+strictly-above-tau majority via atomicAdd-assigned output slots, on the
+reasoning that "row gather only needs the index set, not an ordering" --
+true for the gather itself, false for what happens next:
+`gemv_w4a16_sparse_accumulate` sums the gathered rows' contributions in
+ARRAY ORDER, and float summation is not order-independent. Same k
+channels, summed in a different (atomicAdd-race-dependent) order,
+produces a different rounded result every call -- compounding across 28
+decoder layers and 70 tokens into a real, multi-percent perplexity swing.
+Earlier that same day's tie-break fix was necessary but insufficient: it
+made the boundary-tied portion of the output order-stable, but left the
+(much larger) unambiguous majority's order to atomicAdd race timing,
+because at that point the only test in hand (M8 calibration's histogram
+determinism) checks integer COUNTS, which are order-independent by
+construction -- blind to this class of bug entirely.
+
+**Why invisible until now:** this project's usual small synthetic-model
+test scale (intermediate_size ~128, k~16-64) only ever has a handful of
+this kernel's 1024 threads doing real work in the compaction loop -- not
+enough scheduling variance for the atomicAdd race to visibly reorder
+anything in practice. At n=6144 (Qwen3-1.7B's real intermediate_size,
+k=3072), all 1024 threads contend, and the reordering becomes real. Same
+"invisible in isolation, real at production scale" shape as the M6 race,
+the cuBLAS-algorithm-selection bug, and the LRU cache bug -- four
+instances of the exact same lesson inside one project now. A secondary
+trap on top of the primary bug: after fixing the kernel and rebuilding,
+a diagnostic INSIDE THE SAME LONG-LIVED COLAB KERNEL PROCESS still showed
+non-determinism -- not a remaining bug, but a stale compiled `_C.so`
+still resident in process memory from before the fix (`pip install -e .`
+overwrites the file on disk; deleting Python-level `sys.modules` entries
+does not force the OS dynamic linker to unload and re-`dlopen` an
+already-mapped native extension). Running the SAME check as a fresh
+`python -c "..."` subprocess -- which always loads whatever is currently
+on disk -- confirmed the real fix. Lesson: after rebuilding a CUDA
+extension mid-session, verify in a fresh process, not a notebook cell
+that may have imported the old `.so` earlier in the same kernel's
+lifetime.
+
+**Fix:** replaced Phase 3's two-part compaction (parallel atomicAdd for
+the majority, single-thread ascending-order fill for tie remainders)
+with one single deterministic ascending-index scan for the ENTIRE
+output. Simpler code, and the full output (set AND order) is now a pure
+function of the input, verified with a new regression test at n=6144
+(the scale that exposed this) checking `torch.equal` -- not just
+matching sets -- across 10 repeated calls.
+
+**Consequence for M7's own numbers:** M7's Pareto curve (`reports/m7_pareto.csv`,
+knee at k/I≈0.375-0.5) was generated using the SAME buggy kernel. Whether
+those specific numbers would have come out meaningfully different under
+the fix is unconfirmed -- re-running that sweep is the natural follow-up
+before treating the knee as load-bearing for any README claim, on top of
+the "one short passage" caveat [[project-lesson-verify-at-scale]] already
+flagged. Today's fixed ablation table's own DIP row (k/I=0.5, ppl=231.26,
+14.01x dense) is in the same ballpark as M7's recorded 15.26x at the same
+k/I -- consistent, not contradicted, but not the same run.
+
+**The ablation table itself** (`reports/m8_ablation.csv`, Qwen3-1.7B,
+dip_k=3072 at k/I=0.5, cache_size=614 at 10% of I, calibrated on a
+SEPARATE passage from the eval text), reproduced bit-for-bit across two
+independent full runs after the fix:
+
+| mode | bytes/token | bytes saved vs dense | tok/s | perplexity | ppl ratio |
+|---|---|---|---|---|---|
+| dense | 704,643,072 | 0.0% | 12.08 | 16.504 | 1.000 |
+| +DIP | 528,482,304 | 25.0% | 7.64 | 231.262 | 14.013 |
+| +cache-aware DIP | 496,382,656 | 29.6% | 7.03-7.31 | 231.262 | 14.013 |
+
+Cache-aware DIP's perplexity is BIT-IDENTICAL to plain DIP's (not just
+close) -- direct, real-hardware confirmation that caching changes only
+where bytes come from, never the arithmetic, exactly as the unit tests
+claimed. Bytes saved keeps improving (29.6% vs 25.0%) for that identical
+output. Tokens/sec does NOT show a clear win yet at this cache fraction
+(10% of I) and model size (1.7B) -- consistent with M6/M7's own
+already-documented finding that per-token mechanism overhead
+(`miss_count.item()` host sync, Python-level bookkeeping) dominates at
+small scale before transfer savings show up as wall-clock speedup. An
+honest result, not a headline one: the byte-savings thesis is proven:
+the throughput thesis needs a bigger cache fraction, a bigger model, or
+both to actually show up in tok/s -- the natural next question for M9's
+fuller ablation matrix.
