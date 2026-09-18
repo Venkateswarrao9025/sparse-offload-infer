@@ -1606,3 +1606,37 @@ all 25 rows (7 reused from `m7_pareto.csv` + 18 new). Extending to the 14B
 model or additional quant formats is the natural follow-up if a fuller
 sweep is wanted -- the script is written so that's a loop to add, not a
 rewrite.
+
+### 2026-09-18 (continued) -- M9 task 3: robustness review finds a real ragged-tail gap
+
+Reviewed `csrc/bindings.cpp` (582 lines, 90+ existing `TORCH_CHECK`s --
+already fairly thorough) against PROJECT_SPEC.md M9 task 3's named
+concerns. Arch guards: trivially satisfied, since no kernel in this
+codebase has ANY Ampere+-only code path (everything uniformly targets
+sm_75) -- nothing to guard. Shape/dtype/pinned-memory/bounds checks on
+`kv_cache_append`/`decode_attention`/`rope_apply`/`gather_rows_*`: already
+solid.
+
+Found one real gap, and it's the spec's own named example: every
+quantized-GEMV binding derived `num_groups` from `scale.size(1)` and
+trusted it, never cross-checking against `ceil(K/group_size)` -- the value
+the kernel actually needs, since it indexes `scale[row][k/group_size]` for
+`k` up to `K-1`. A ragged `K` (not a multiple of `group_size`) still needs
+exactly `ceil(K/group_size)` groups, the last one just partially filled --
+a caller passing a scale tensor with too few columns (mismatched
+group_size, or any other bug) got a SILENT out-of-bounds read inside the
+kernel, not a loud failure. Fixed across all 5 affected bindings
+(`gemv_w8a16`, `gemv_w4a16_group`/`_lop3`, `gemv_w4a16_sparse_accumulate`,
+`gemv_dip_fused_up`/`_down`), each with a regression test using a
+genuinely ragged K/H and a deliberately undersized scale tensor. 189/189
+tests pass (5 new).
+
+**A deliberate non-fix, documented rather than silently skipped**:
+`topk_threshold_select`'s "vals assumed non-negative" precondition is
+NOT enforced with a runtime check -- doing so would need a `.item()`
+device sync on this project's single most latency-critical kernel
+(called every layer, every token, in DIP mode), defeating its whole
+design goal. The one real caller always passes `gate.abs()` by
+construction. Worth stating explicitly: not every documented precondition
+should become a runtime check, and the tradeoff (sync cost vs.
+loud-failure guarantee) is worth naming rather than leaving implicit.
