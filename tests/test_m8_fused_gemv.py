@@ -288,3 +288,20 @@ def test_gemv_dip_fused_up_rejects_mismatched_num_groups():
     bad_staging_Wq = torch.empty(0, Wq.shape[1], dtype=torch.uint8, device="cuda")
     with pytest.raises(RuntimeError):
         soinfer.ops.gemv_dip_fused_up(Wq, scale, bad_staging_Wq, bad_staging_scale, descriptors, x, H, group_size)
+
+
+def test_gemv_dip_fused_up_rejects_scale_with_too_few_groups():
+    """M9 task 3 (robustness): num_groups must equal ceil(H/group_size),
+    including for a ragged H -- a scale tensor with too few columns (but
+    matching between cache/staging, so the OTHER mismatch check above
+    doesn't catch it) used to cause a silent out-of-bounds read."""
+    torch.manual_seed(8)
+    k, H, group_size = 8, 65, 32  # ragged H: not a multiple of group_size
+    Wq, scale, _ = _quantize_pack(torch.randn(k, H), group_size)  # true num_groups = ceil(65/32) = 3
+    bad_scale = scale[:, :2].contiguous()  # only 2 groups, should be 3 -- but matches for cache AND staging
+    descriptors = torch.arange(k, dtype=torch.int32, device="cuda")
+    x = torch.randn(H, device="cuda", dtype=torch.float16)
+    empty_Wq = torch.empty(0, Wq.shape[1], dtype=torch.uint8, device="cuda")
+    empty_scale = torch.empty(0, bad_scale.shape[1], dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError):
+        soinfer.ops.gemv_dip_fused_up(Wq, bad_scale, empty_Wq, empty_scale, descriptors, x, H, group_size)

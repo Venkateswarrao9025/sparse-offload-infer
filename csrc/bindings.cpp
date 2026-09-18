@@ -45,6 +45,19 @@ half* half_ptr(torch::Tensor& t) {
     return reinterpret_cast<half*>(t.data_ptr<at::Half>());
 }
 
+// M9 task 3 (robustness): every quantized-GEMV kernel indexes scale as
+// scale[row][k / group_size] for k up to K-1, so num_groups (whatever the
+// caller's scale tensor happens to have as its second dimension) MUST equal
+// ceil(K / group_size) -- a ragged tail (K not a multiple of group_size)
+// still needs exactly this many groups, the last one just partially filled.
+// Before this check existed, a caller passing a scale tensor with too few
+// columns (a mismatched group_size, or any other caller-side bug) caused a
+// silent out-of-bounds read inside the kernel instead of a loud failure at
+// the binding boundary -- caught by review, not by a failing test.
+int64_t expected_num_groups(int64_t k_dim, int64_t group_size) {
+    return (k_dim + group_size - 1) / group_size;
+}
+
 }  // namespace
 
 torch::Tensor add_one(torch::Tensor x) {
@@ -238,6 +251,9 @@ torch::Tensor gemv_w8a16(torch::Tensor Wq, torch::Tensor scale, torch::Tensor x,
     TORCH_CHECK(num_groups == 1 || group_size % 4 == 0, "gemv_w8a16: group_size must be a multiple of 4 when "
                                                           "num_groups > 1 (kernel reads 4 packed int8 per uint32 "
                                                           "word and must never span two quant groups)");
+    TORCH_CHECK(num_groups == 1 || num_groups == expected_num_groups(K, group_size), "gemv_w8a16: scale's "
+                "num_groups must be 1 (per-tensor broadcast) or ceil(K/group_size) for the given K and group_size, "
+                "got ", num_groups, " but expected ", expected_num_groups(K, group_size));
     auto y = torch::empty({N}, x.options());
     launch_gemv_w8a16(Wq.data_ptr<int8_t>(), scale.data_ptr<float>(), half_ptr(x), half_ptr(y),
                        static_cast<int>(N), static_cast<int>(K), static_cast<int>(group_size),
@@ -269,6 +285,9 @@ torch::Tensor gemv_w4a16_group_impl(torch::Tensor Wq_packed, torch::Tensor scale
     TORCH_CHECK(scale.dim() == 2 && scale.size(0) == N, name,
                 ": scale must be 2D [N, num_groups] (grouped int4 has no per-tensor broadcast)");
     const int64_t num_groups = scale.size(1);
+    TORCH_CHECK(num_groups == expected_num_groups(K, group_size), name, ": scale's num_groups must be "
+                "ceil(K/group_size) for the given K and group_size, got ", num_groups, " but expected ",
+                expected_num_groups(K, group_size));
 
     auto y = torch::empty({N}, x.options());
     launcher(Wq_packed.data_ptr<uint8_t>(), scale.data_ptr<float>(), half_ptr(x), half_ptr(y),
@@ -308,6 +327,9 @@ torch::Tensor gemv_w4a16_sparse_accumulate(torch::Tensor Wq_selected, torch::Ten
     check_f16_cuda_contiguous(h_selected, "gemv_w4a16_sparse_accumulate(h_selected)");
     TORCH_CHECK(h_selected.dim() == 1 && h_selected.size(0) == k, name, ": h_selected must be 1D [k]");
     const int64_t num_groups = scale_selected.size(1);
+    TORCH_CHECK(num_groups == expected_num_groups(H, group_size), name, ": scale_selected's num_groups must be "
+                "ceil(H/group_size) for the given H and group_size, got ", num_groups, " but expected ",
+                expected_num_groups(H, group_size));
 
     auto y = torch::empty({H}, h_selected.options());
     launch_gemv_w4a16_sparse_accumulate(Wq_selected.data_ptr<uint8_t>(), scale_selected.data_ptr<float>(),
@@ -374,6 +396,9 @@ torch::Tensor gemv_dip_fused_up(torch::Tensor cache_Wq, torch::Tensor cache_scal
 
     const int64_t k = descriptors.size(0);
     const int64_t num_groups = cache_scale.size(1);
+    TORCH_CHECK(num_groups == expected_num_groups(K, group_size), name, ": cache_scale/staging_scale's num_groups "
+                "must be ceil(K/group_size) for the given K and group_size, got ", num_groups, " but expected ",
+                expected_num_groups(K, group_size));
     auto y = torch::empty({k}, x.options());
     launch_gemv_dip_fused_up(cache_Wq.data_ptr<uint8_t>(), cache_scale.data_ptr<float>(),
                               staging_Wq.data_ptr<uint8_t>(), staging_scale.data_ptr<float>(),
@@ -394,6 +419,9 @@ torch::Tensor gemv_dip_fused_down(torch::Tensor cache_Wq, torch::Tensor cache_sc
     TORCH_CHECK(group_size >= 1 && group_size % 8 == 0, name, ": group_size must be a positive multiple of 8");
 
     const int64_t num_groups = cache_scale.size(1);
+    TORCH_CHECK(num_groups == expected_num_groups(H, group_size), name, ": cache_scale/staging_scale's num_groups "
+                "must be ceil(H/group_size) for the given H and group_size, got ", num_groups, " but expected ",
+                expected_num_groups(H, group_size));
     auto y = torch::empty({H}, h_selected.options());
     launch_gemv_dip_fused_down(cache_Wq.data_ptr<uint8_t>(), cache_scale.data_ptr<float>(),
                                 staging_Wq.data_ptr<uint8_t>(), staging_scale.data_ptr<float>(),

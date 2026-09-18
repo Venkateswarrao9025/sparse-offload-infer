@@ -93,6 +93,22 @@ def test_w8a16_rejects_misaligned_group_size():
         soinfer.ops.gemv_w8a16(Wq, scale, x, 3)
 
 
+def test_w8a16_rejects_scale_with_too_few_groups():
+    """M9 task 3 (robustness): num_groups must equal ceil(K/group_size) --
+    a scale tensor with fewer columns than that used to cause a silent
+    out-of-bounds read inside the kernel (scale[row][k/group_size] for k
+    near K-1 would read past scale's actual last column) instead of a
+    loud failure at the binding boundary."""
+    W = torch.randn(4, 64)
+    qt = _quantize(8, W, "group", 16)  # true num_groups = 64/16 = 4
+    Wq, _ = pack.pack_int8(qt.qweight)
+    Wq = Wq.cuda()
+    bad_scale = qt.scale[:, :3].contiguous().cuda()  # only 3 groups, should be 4
+    x = torch.randn(64, device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError):
+        soinfer.ops.gemv_w8a16(Wq, bad_scale, x, 16)
+
+
 # ---------------------------------------------------------------------------
 # W4A16 (naive scalar dequant, and the LOP3 bit-pattern-construction dequant)
 # ---------------------------------------------------------------------------
@@ -179,3 +195,21 @@ def test_w4a16_rejects_group_size_not_multiple_of_8():
     x = torch.randn(64, device="cuda", dtype=torch.float16)
     with pytest.raises(RuntimeError):
         soinfer.ops.gemv_w4a16_group(Wq_packed, scale, x, 64, 7)
+
+
+@pytest.mark.parametrize("gemv_fn_name", W4A16_FNS)
+def test_w4a16_rejects_scale_with_too_few_groups(gemv_fn_name):
+    """M9 task 3 (robustness): num_groups must equal ceil(K/group_size),
+    including for a ragged K (not a multiple of group_size) -- the last
+    group is only partially filled, but it still needs to exist. A scale
+    tensor with too few columns used to cause a silent out-of-bounds read
+    instead of a loud failure."""
+    W = torch.randn(4, 65)  # ragged: 65 is not a multiple of group_size=32
+    qt = _quantize(4, W, "group", 32)  # true num_groups = ceil(65/32) = 3
+    Wq_packed, packed_k = pack.pack_int4(qt.qweight)
+    Wq_packed = Wq_packed.cuda()
+    bad_scale = qt.scale[:, :2].contiguous().cuda()  # only 2 groups, should be 3
+    x = torch.randn(packed_k, device="cuda", dtype=torch.float16)
+    gemv_fn = getattr(soinfer.ops, gemv_fn_name)
+    with pytest.raises(RuntimeError):
+        gemv_fn(Wq_packed, bad_scale, x, packed_k, 32)

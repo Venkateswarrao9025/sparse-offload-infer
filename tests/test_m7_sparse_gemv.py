@@ -150,3 +150,15 @@ def test_sparse_accumulate_rejects_shape_mismatches():
         soinfer.ops.gemv_w4a16_sparse_accumulate(Wq, scale[:-1], h_selected, H, group_size)
     with pytest.raises(RuntimeError):  # group_size not a multiple of 8
         soinfer.ops.gemv_w4a16_sparse_accumulate(Wq, scale, h_selected, H, 5)
+
+
+def test_sparse_accumulate_rejects_scale_with_too_few_groups():
+    """M9 task 3 (robustness): num_groups must equal ceil(H/group_size) --
+    a scale tensor with fewer columns used to cause a silent out-of-bounds
+    read inside the kernel instead of a loud failure."""
+    k, H, group_size = 16, 65, 32  # ragged H: not a multiple of group_size
+    Wq, scale, _ = _quantize_pack(torch.randn(k, H), group_size)  # true num_groups = ceil(65/32) = 3
+    bad_scale = scale[:, :2].contiguous()  # only 2 groups, should be 3
+    h_selected = torch.randn(k, device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError):
+        soinfer.ops.gemv_w4a16_sparse_accumulate(Wq, bad_scale, h_selected, H, group_size)
