@@ -113,6 +113,9 @@ for every number in `reports/`.
 
 ## More
 
+- **New to this project? Start here:** [docs/OVERVIEW.md](docs/OVERVIEW.md) --
+  what this is, why each piece exists, how it fits together, and the
+  milestone-by-milestone story in plain language
 - Full spec and milestone plan: [PROJECT_SPEC.md](PROJECT_SPEC.md)
 - Complete results, every milestone: [docs/RESULTS.md](docs/RESULTS.md)
 - Design decisions and deviations from spec: [docs/DESIGN.md](docs/DESIGN.md)
