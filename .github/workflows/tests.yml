@@ -1,0 +1,46 @@
+name: tests
+
+# M9 task 4 (PROJECT_SPEC.md): CPU-side tests only -- pack/unpack round-trip,
+# quantize/dequantize (test_quant_roundtrip.py), and hot_cache.py's
+# trace-driven policy simulation (test_hot_cache.py). Every other test file
+# needs a real NVIDIA GPU (pytest.mark.skipif(not torch.cuda.is_available())
+# on each) and is automatically skipped here, not run -- there is no GPU
+# runner in this workflow. To run the full suite including CUDA kernel
+# tests, use a Colab or Kaggle T4 session: `git pull && make build && make
+# test` (see docs/LEARNING_NOTES.md and README.md for the full workflow;
+# this project's own dev machine has no NVIDIA GPU either, so this is the
+# same path a contributor would use).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU-only torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # No CUDA toolkit on this runner -- setup.py's HAS_CUDA check falls
+      # back to a pure-Python install (soinfer.ops stays None), which is
+      # exactly what the CPU-only test files below need.
+      - name: Install soinfer
+        run: pip install -e . --no-build-isolation -v
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      # GPU-requiring test files self-skip via their own
+      # pytest.mark.skipif(not torch.cuda.is_available()) -- running the
+      # full tests/ directory here is intentional, not a mistake.
+      - name: Run tests
+        run: pytest tests/ -v
