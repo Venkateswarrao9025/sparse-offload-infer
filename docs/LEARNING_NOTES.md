@@ -1640,3 +1640,44 @@ design goal. The one real caller always passes `gate.abs()` by
 construction. Worth stating explicitly: not every documented precondition
 should become a runtime check, and the tradeoff (sync cost vs.
 loud-failure guarantee) is worth naming rather than leaving implicit.
+
+### 2026-09-18 (continued) -- the determinism fix's real cost: re-timed topk_select.cu, found an honest ~8x regression
+
+Writing up RESULTS.md, M9's Nsight Compute profile (`reports/m9_ncu_summary.md`)
+showed `topk_threshold_select` at 3.70ms for I=17408, k/I=0.5 -- vs.
+`reports/m7_topk_timing.csv`'s PRE-FIX 180.9μs at the same shape, a ~20x gap.
+Before writing that number into RESULTS.md, checked whether it was real or a
+`ncu --set full` profiling-overhead artifact (comprehensive metric
+collection is known to inflate reported kernel duration, not just
+wall-clock time around it) by re-running `bench/bench_m7_topk.py` -- a
+clean, non-instrumented timing -- post-fix. **It's real, just smaller than
+the profiled number suggested**: 1446.1μs vs. the old 180.9μs at the same
+shape, an honest **~8x** regression from clean-timing comparison (the
+profiled 20x included real ncu instrumentation overhead on top of that).
+
+This is the direct, quantified cost of the Phase 3 rewrite earlier today
+(atomicAdd-parallel compaction -> single-threaded ascending-index scan) --
+traded for a correctness guarantee (bit-for-bit reproducible output, not
+just a reproducible SET) that was genuinely necessary, not optional: the
+old version produced different perplexity on back-to-back runs of the
+identical model. That tradeoff was the right call, but its cost should be
+on the record precisely, not left as "acceptable because correctness
+matters more" without a number attached. Combined with M7's
+already-documented single-block limitation (~18x over target before any
+of today's fixes), this kernel is now roughly **144x over its original
+single-digit-microsecond target** (17.4μs would be the target at this
+scale; measured 1446μs).
+
+`reports/m7_topk_timing.csv` updated to the corrected, post-fix numbers
+(the pre-fix numbers are no longer representative of the current kernel
+and would mislead a reader). This makes M7's own follow-up note
+("radix-select or multi-block/cooperative-groups redesign, not started")
+considerably more urgent than it looked before today -- not a nice-to-have
+optimization, but the direct, measured cost of a correctness fix this
+session had to make. The natural next step, not undertaken here (M9's
+brief was measurement and hardening, not a kernel rewrite): a multi-block
+version of Phase 3's final compaction that keeps the deterministic
+ascending-order guarantee (e.g. a parallel prefix-sum/stream-compaction
+across blocks, rather than either the old unordered atomic race or
+today's single-thread scan) would very plausibly recover most of this
+regression without reintroducing the non-determinism.
