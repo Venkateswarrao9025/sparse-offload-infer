@@ -74,6 +74,12 @@ profile-m6-overlap:
 	nsys stats --report cuda_gpu_trace --format csv --output reports/m6_overlap_profile reports/m6_overlap_profile.nsys-rep
 	python bench/analyze_nsys_overlap.py reports/m6_overlap_profile_cuda_gpu_trace.csv
 
+# M9 task 1: Nsight Compute on every hot kernel (occupancy, memory throughput,
+# warp stall reasons, register count). ncu ships with the CUDA toolkit,
+# possibly not on PATH -- e.g. under /opt/nvidia/nsight-compute/<version>/ncu.
+profile-m9-kernels:
+	ncu --set basic --capture-range=cudaProfilerApi --csv --log-file reports/m9_ncu_report.csv python bench/profile_m9_kernels.py
+
 clean:
 	rm -rf build/ *.egg-info python/soinfer.egg-info
 	find . -name "__pycache__" -type d -exec rm -rf {} +
