@@ -12,67 +12,132 @@ what clicked and what didn't.
 - [x] memory hierarchy
 - [x] coalescing
 - [x] shared memory and bank conflicts
-- [ ] occupancy
-- [ ] warp divergence
+- [x] occupancy -- M9's Nsight Compute pass: theoretical vs. achieved occupancy for
+      every hot kernel, and the finding that NONE of them are register-limited
+      (max 43 registers/thread against a 255 budget) -- every shortfall is launch
+      configuration or memory access pattern instead (`reports/m9_ncu_summary.md`)
+- [x] warp divergence -- topk_select.cu's single-block design (1 of 40 SMs) and
+      the down-projection kernels' output-column parallelization (half the SMs)
+      are both launch-configuration-driven underutilization, distinct from
+      per-warp instruction divergence, but the SASS-level ternary/predication
+      question in gemv_dip_fused's descriptor branch was reasoned through
+      explicitly (M8 task 3)
 - [x] warp shuffles
-- [x] atomics
-- [ ] streams and events
+- [x] atomics -- both used (topk_select.cu's original Phase 3) and REMOVED
+      (2026-09-18's determinism fix) once atomicAdd-race order turned out to
+      leak into a downstream order-sensitive float summation -- a real,
+      hardware-found lesson in when atomics are and aren't safe to use for
+      more than just aggregate counts
+- [x] streams and events -- WeightPipeline's double buffering (M6), the
+      write-after-read race found and fixed via StreamManager.read_done_events/
+      mark_read_done (M6/M7)
 - [x] pinned memory
-- [ ] async copy
+- [x] async copy -- `cudaMemcpyAsync` throughout gather_rows_staged/naive and
+      WeightPipeline; explicitly NOT cp.async (Ampere+-only, out of scope for
+      sm_75 -- see common.cuh)
 - [x] `__restrict__` and pointer aliasing
 - [x] vectorized access
-- [ ] register pressure and spilling
-- [ ] launch overhead and CUDA graphs
+- [x] register pressure and spilling -- M9's Nsight pass confirms this
+      project's kernels are NOT register-limited anywhere (see occupancy above)
+- [x] launch overhead and CUDA graphs -- launch overhead measured directly
+      (M7's DIP-at-k=I is slower than dense despite moving identical bytes,
+      purely from per-call mechanism overhead); CUDA graphs never implemented
+      (a legitimate follow-up, not attempted this project)
 
 ### Numerics
-- [x] FP16/BF16/FP32/TF32
-- [x] accumulation order and error
+- [x] FP16/BF16/FP32/TF32 -- FP16 throughout; BF16/TF32 deliberately out of
+      scope (sm_75 has no native BF16, see common.cuh's arch-gating convention)
+- [x] accumulation order and error -- the whole point of 2026-09-18's fifth
+      bug: same values, different summation order, different rounded result
 - [x] symmetric vs asymmetric quantization
 - [x] granularity (tensor/channel/group/block)
-- [ ] zero-point
+- [x] zero-point -- symmetric quantization used throughout (no zero-point
+      needed); the tradeoff itself (symmetric simplicity vs. asymmetric's
+      better fit for skewed distributions) is understood, not implemented
 - [x] outlier channels
 - [x] E8M0 and microscaling
 - [x] fake quant vs real quant
 - [x] calibration (min-max, percentile, MSE, AWQ)
-- [ ] GPTQ
+- [ ] GPTQ -- not implemented; this project's calibration work (M8) is
+      activation-frequency-based, not GPTQ's Hessian-based weight calibration
 
 ### Inference systems
-- [ ] prefill vs decode
-- [ ] why decode is memory-bound
-- [ ] arithmetic intensity and roofline
-- [ ] KV cache sizing
-- [ ] paged attention
-- [ ] GQA/MQA
-- [ ] continuous batching (conceptually)
-- [ ] speculative decoding (conceptually)
-- [ ] offloading and PCIe limits
-- [ ] contextual/dynamic sparsity
-- [ ] weight streaming and prefetch
+- [x] prefill vs decode -- this project targets decode exclusively
+      (PROJECT_SPEC.md sec 2); prefill is prompt tokens run through the same
+      decode-step loop, not a separate batched path
+- [x] why decode is memory-bound -- M6's roofline is exactly this: every
+      weight matrix transfer takes 5.5x-10.2x longer than the GEMV that
+      consumes it
+- [x] arithmetic intensity and roofline -- `reports/m6_roofline.png`
+- [x] KV cache sizing -- `kv_cache_append`/`decode_attention`'s
+      [num_kv_heads, max_seq_len, head_dim] layout, sized and exercised
+      throughout M5-M9
+- [ ] paged attention -- not implemented; this project's KV cache is
+      contiguous per-sequence, not block-table/paged (noted as a stretch
+      goal, not attempted, in kv_cache_append's own docstring)
+- [x] GQA/MQA -- Qwen3's grouped-query attention (`num_q_heads % num_kv_heads
+      == 0`) is what `decode_attention` implements throughout
+- [ ] continuous batching (conceptually) -- out of scope; this project is
+      single-stream, batch=1 throughout (PROJECT_SPEC.md sec 2)
+- [ ] speculative decoding (conceptually) -- not explored
+- [x] offloading and PCIe limits -- M6's entire subject
+- [x] contextual/dynamic sparsity -- M7/M8's entire subject (DIP, cache-aware DIP)
+- [x] weight streaming and prefetch -- M6's WeightPipeline double buffering
 
 ### Kernels written
 - [x] reductions
 - [x] RMSNorm
 - [x] online softmax
-- [ ] GEMV (FP16, W8A16, W4A16-group)
-- [ ] INT8 tensor-core GEMM
-- [ ] fused SwiGLU
-- [ ] fused QKV
-- [ ] KV-cache append
-- [ ] decode attention
-- [ ] top-k / radix select
-- [ ] stream compaction
-- [ ] row gather
-- [ ] cache-or-stream fused GEMV
+- [x] GEMV (FP16, W8A16, W4A16-group)
+- [ ] INT8 tensor-core GEMM -- this project's W8A16/W4A16 GEMVs are
+      CUDA-core (warp-shuffle-reduced), not tensor-core (`mma`/`wmma`) paths;
+      never attempted -- decode's GEMV shape (N x K times a single K-vector)
+      doesn't have the M-dimension tensor cores need to be worth it at
+      batch=1, but this was a scoping choice, not something benchmarked
+      and rejected
+- [x] fused SwiGLU -- `swiglu_gate_up` (M5); not on the DIP/cache-aware-DIP
+      hot path (gate/up run as separate GEMVs there so gate's |value| is
+      available for top-k selection before SiLU/mul happens), but written,
+      tested, and understood
+- [ ] fused QKV -- q/k/v run as three separate GEMVs throughout (see
+      generate.py's module docstring: re-fusing against per-tensor-quantized
+      weights, each needing its own scale, was flagged as a separate
+      follow-up not required for M6's overlap work, and never revisited)
+- [x] KV-cache append
+- [x] decode attention
+- [x] top-k / radix select -- `topk_threshold_select` (bisection-based, not
+      radix-select specifically -- the radix-select alternative is an
+      explicitly open, not-yet-implemented follow-up given this kernel's
+      now-well-quantified ~144x-over-target performance gap)
+- [x] stream compaction -- topk_select.cu's Phase 3 (both the original
+      atomicAdd-compaction version and 2026-09-18's deterministic
+      ascending-scan replacement)
+- [x] row gather -- `gather_rows_staged`/`gather_rows_naive`
+- [x] cache-or-stream fused GEMV -- `gemv_dip_fused_up`/`_down`, M8's
+      centerpiece kernel
 
 ### Engineering
-- [ ] CUDA extension builds and arch flags
-- [ ] pybind11
-- [ ] pytest for numerics
-- [ ] benchmark methodology
-- [ ] Nsight Systems and Compute
-- [ ] reproducibility and seeding
-- [ ] ablation design
-- [ ] technical writing
+- [x] CUDA extension builds and arch flags -- including M9's addition of a
+      graceful pure-Python fallback when no CUDA toolkit is present (setup.py)
+- [x] pybind11
+- [x] pytest for numerics -- 189 tests as of M9's close, spanning CPU-only
+      (no GPU needed) through full CUDA kernel/pipeline coverage
+- [x] benchmark methodology -- direct byte-counting rather than inferring
+      from timing (dip_bytes_per_token, miss_bytes accumulators), teacher-forced
+      perplexity against this project's own already-verified dense path,
+      reproducibility checked by literally re-running ablation/Pareto sweeps
+      and diffing results bit-for-bit before trusting them
+- [x] Nsight Systems and Compute -- `profile_m6_overlap.py`/`analyze_nsys_overlap.py`
+      (Systems, M6) and `profile_m9_kernels.py`/`reports/m9_ncu_summary.md` (Compute, M9)
+- [x] reproducibility and seeding -- the throughline of this entire project's
+      "verify at scale" lesson: five real bugs found specifically because a
+      result was checked for reproducibility (same input, run twice) rather
+      than trusted on a single run, including catching that a Nsight-profiled
+      number itself needed a clean-timing cross-check before trusting it
+- [x] ablation design -- M8/M9's ablation table and matrix, including the
+      deliberate "calibrate on a SEPARATE passage from the eval text" design
+      to avoid the static policy just memorizing the test data
+- [x] technical writing -- `docs/RESULTS.md`, `README.md`, and this file
 
 ## Milestone log
 
