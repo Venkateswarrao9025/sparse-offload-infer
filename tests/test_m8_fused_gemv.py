@@ -72,7 +72,10 @@ def _build_descriptors(k: int, cache_logical: list[int], staging_logical: list[i
     for slot, j in enumerate(cache_logical):
         descriptors[j] = slot
     for pos, j in enumerate(staging_logical):
-        descriptors[j] = pos | (1 << 31)
+        # pos | (1 << 31) is >= 2**31, out of signed int32 range as a plain
+        # Python int; subtract 2**32 to get the same bit pattern as the
+        # negative int32 the kernel produces (see gemv_dip_fused.cu).
+        descriptors[j] = (pos | (1 << 31)) - (1 << 32)
     return descriptors.cuda()
 
 
